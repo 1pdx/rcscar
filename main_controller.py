@@ -3,9 +3,11 @@
 import importlib.util
 import math
 import threading
+import time
+from dataclasses import dataclass
 from pathlib import Path
 import sys
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from PyQt5 import QtWidgets
 from imu_gnss_pose import get_robot_pose, calibrate_pose_to_current, PoseSolution
@@ -15,6 +17,28 @@ from can_init import init_can, CanInitResult
 
 
 _RADAR_MODULE = None
+PathPoint = Tuple[float, float]
+PathSegmentRange = Tuple[int, int, int, bool, float, float, float]
+STRAIGHT_POINT_COUNT = 2
+DEFAULT_ACCEL_DIST_M = 1.5
+DEFAULT_DECEL_DIST_M = 1.5
+
+
+@dataclass
+class QueuedPathTask:
+    name: str
+    local_points: List[PathPoint]
+    ranges: List[PathSegmentRange]
+
+
+@dataclass
+class PlannedTaskSequence:
+    task_names: List[str]
+    local_points: List[PathPoint]
+    ranges: List[PathSegmentRange]
+    range_task_names: List[Optional[str]]
+    transition_count: int
+    transition_pairs: List[Tuple[str, str]]
 
 
 def _load_radar_processing_module():
@@ -124,6 +148,28 @@ class MainController:
         self._car_batt_v_min = 23.0
         self._car_batt_v_max = 29.25
 
+    def _estimate_car_battery_percent(self, voltage: float) -> Optional[float]:
+        if voltage <= 1e-3:
+            return None
+        if self._car_batt_v_max <= self._car_batt_v_min:
+            return None
+        percent = (voltage - self._car_batt_v_min) / (
+            self._car_batt_v_max - self._car_batt_v_min
+        ) * 100.0
+        return max(0.0, min(100.0, percent))
+
+    @staticmethod
+    def _describe_car_control_mode(mode: int) -> str:
+        return {
+            0: "待机",
+            1: "CAN",
+            3: "遥控",
+        }.get(int(mode), f"未知({int(mode)})")
+
+    def evaluate_circle_motion(self, radius_m: float, speed_mps: float) -> Dict[str, Any]:
+        planner = self.car if self.car is not None else ScoutMiniCAN
+        return planner.evaluate_circle_command(radius_m, speed_mps)
+
     def ensure_car_ready(self, parent_window) -> bool:
         """确保小车准备就绪"""
         if self.car is None:
@@ -134,6 +180,417 @@ class MainController:
             )
             return False
         return True
+
+    @staticmethod
+    def _wrap_angle(angle: float) -> float:
+        while angle > math.pi:
+            angle -= 2.0 * math.pi
+        while angle < -math.pi:
+            angle += 2.0 * math.pi
+        return angle
+
+    @staticmethod
+    def _normalize_speed_sign(value: Any) -> int:
+        try:
+            return -1 if float(value) < 0 else 1
+        except (TypeError, ValueError):
+            return 1
+
+    @staticmethod
+    def _normalize_positive_float(value: Any, default: float) -> float:
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return float(default)
+        if not math.isfinite(result):
+            return float(default)
+        return max(0.0, result)
+
+    @classmethod
+    def _normalize_speed_mps(cls, value: Any, default: float = 0.5) -> float:
+        return max(0.08, cls._normalize_positive_float(value, default))
+
+    @classmethod
+    def _normalize_segment_range(cls, value: Tuple[Any, ...]) -> PathSegmentRange:
+        start_idx = int(value[0])
+        end_idx = int(value[1])
+        speed_sign = cls._normalize_speed_sign(value[2] if len(value) >= 3 else 1)
+        rcs_start = bool(value[3]) if len(value) >= 4 else False
+        speed_mps = cls._normalize_speed_mps(value[4] if len(value) >= 5 else 0.5)
+        accel_dist = cls._normalize_positive_float(
+            value[5] if len(value) >= 6 else DEFAULT_ACCEL_DIST_M,
+            DEFAULT_ACCEL_DIST_M,
+        )
+        decel_dist = cls._normalize_positive_float(
+            value[6] if len(value) >= 7 else DEFAULT_DECEL_DIST_M,
+            DEFAULT_DECEL_DIST_M,
+        )
+        return (
+            start_idx,
+            end_idx,
+            speed_sign,
+            rcs_start,
+            speed_mps,
+            accel_dist,
+            decel_dist,
+        )
+
+    @staticmethod
+    def _path_length(points: List[PathPoint]) -> float:
+        total_len = 0.0
+        for i in range(len(points) - 1):
+            dx = points[i + 1][0] - points[i][0]
+            dy = points[i + 1][1] - points[i][1]
+            total_len += math.hypot(dx, dy)
+        return total_len
+
+    @staticmethod
+    def _find_heading(points: List[PathPoint], at_start: bool) -> float:
+        if len(points) < 2:
+            return 0.0
+        if at_start:
+            indices = range(len(points) - 1)
+        else:
+            indices = range(len(points) - 2, -1, -1)
+        for idx in indices:
+            x0, y0 = points[idx]
+            x1, y1 = points[idx + 1]
+            dx = x1 - x0
+            dy = y1 - y0
+            if dx * dx + dy * dy > 1e-8:
+                return math.atan2(dy, dx)
+        return 0.0
+
+    @classmethod
+    def _path_pose(cls, points: List[PathPoint], at_start: bool) -> Tuple[float, float, float]:
+        if not points:
+            return (0.0, 0.0, 0.0)
+        heading = cls._find_heading(points, at_start=at_start)
+        if at_start:
+            x, y = points[0]
+        else:
+            x, y = points[-1]
+        return (float(x), float(y), float(heading))
+
+    @classmethod
+    def _ensure_task_ranges(
+        cls,
+        points: List[PathPoint],
+        ranges: List[PathSegmentRange],
+    ) -> List[PathSegmentRange]:
+        normalized = [
+            cls._normalize_segment_range(seg_range)
+            for seg_range in (ranges or [])
+            if len(seg_range) >= 2 and int(seg_range[1]) > int(seg_range[0])
+        ]
+        if normalized:
+            return normalized
+        if len(points) < 2:
+            return []
+        return [
+            (
+                0,
+                len(points) - 1,
+                1,
+                False,
+                0.5,
+                DEFAULT_ACCEL_DIST_M,
+                DEFAULT_DECEL_DIST_M,
+            )
+        ]
+
+    @staticmethod
+    def _task_start_speed_abs(ranges: List[PathSegmentRange]) -> float:
+        if not ranges:
+            return 0.5
+        return max(0.08, abs(float(ranges[0][4])))
+
+    @staticmethod
+    def _task_end_speed_abs(ranges: List[PathSegmentRange]) -> float:
+        if not ranges:
+            return 0.5
+        return max(0.08, abs(float(ranges[-1][4])))
+
+    @staticmethod
+    def _sample_line(
+        start: PathPoint,
+        end: PathPoint,
+        step: float = 0.35,
+    ) -> List[PathPoint]:
+        del step
+        x0, y0 = start
+        x1, y1 = end
+        dist = math.hypot(x1 - x0, y1 - y0)
+        if dist <= 1e-8:
+            return [(float(x0), float(y0))]
+        n = max(1, STRAIGHT_POINT_COUNT - 1)
+        points: List[PathPoint] = []
+        for i in range(n + 1):
+            t = i / n
+            points.append((x0 + (x1 - x0) * t, y0 + (y1 - y0) * t))
+        return points
+
+    @staticmethod
+    def _sample_cubic_bezier(
+        p0: PathPoint,
+        p1: PathPoint,
+        p2: PathPoint,
+        p3: PathPoint,
+        step: float = 0.18,
+    ) -> List[PathPoint]:
+        chord = math.hypot(p3[0] - p0[0], p3[1] - p0[1])
+        ctrl_len = (
+            math.hypot(p1[0] - p0[0], p1[1] - p0[1])
+            + math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+            + math.hypot(p3[0] - p2[0], p3[1] - p2[1])
+        )
+        est_len = max(chord, ctrl_len)
+        n = max(6, min(160, int(est_len / max(1e-3, step)) + 1))
+        points: List[PathPoint] = []
+        for i in range(n + 1):
+            t = i / n
+            omt = 1.0 - t
+            x = (
+                (omt ** 3) * p0[0]
+                + 3.0 * (omt ** 2) * t * p1[0]
+                + 3.0 * omt * (t ** 2) * p2[0]
+                + (t ** 3) * p3[0]
+            )
+            y = (
+                (omt ** 3) * p0[1]
+                + 3.0 * (omt ** 2) * t * p1[1]
+                + 3.0 * omt * (t ** 2) * p2[1]
+                + (t ** 3) * p3[1]
+            )
+            points.append((x, y))
+        return points
+
+    def _plan_transition_candidate(
+        self,
+        start_pose: Tuple[float, float, float],
+        end_pose: Tuple[float, float, float],
+        motion_sign: int,
+        close_threshold_m: float,
+    ) -> Optional[Tuple[List[PathPoint], int, float]]:
+        x0, y0, yaw0 = start_pose
+        x1, y1, yaw1 = end_pose
+        dx = x1 - x0
+        dy = y1 - y0
+        dist = math.hypot(dx, dy)
+        motion_yaw0 = yaw0 if motion_sign > 0 else self._wrap_angle(yaw0 + math.pi)
+        motion_yaw1 = yaw1 if motion_sign > 0 else self._wrap_angle(yaw1 + math.pi)
+        if dist <= 1e-6:
+            heading_delta = self._wrap_angle(motion_yaw1 - motion_yaw0)
+            if abs(heading_delta) <= math.radians(8.0):
+                return None
+            tangent_len = max(0.45, min(1.2, 0.55 * abs(heading_delta) + 0.2))
+            ctrl1 = (
+                x0 + tangent_len * math.cos(motion_yaw0),
+                y0 + tangent_len * math.sin(motion_yaw0),
+            )
+            ctrl2 = (
+                x1 - tangent_len * math.cos(motion_yaw1),
+                y1 - tangent_len * math.sin(motion_yaw1),
+            )
+            points = self._sample_cubic_bezier((x0, y0), ctrl1, ctrl2, (x1, y1), step=0.12)
+            path_len = self._path_length(points)
+            if path_len <= 1e-6:
+                return None
+            cost = path_len + 0.25 * abs(heading_delta)
+            return points, motion_sign, cost
+
+        chord_heading = math.atan2(dy, dx)
+        heading_penalty = abs(self._wrap_angle(chord_heading - motion_yaw0)) + abs(
+            self._wrap_angle(motion_yaw1 - chord_heading)
+        )
+
+        if dist < close_threshold_m and heading_penalty <= math.radians(30.0):
+            points = self._sample_line((x0, y0), (x1, y1), step=close_threshold_m / 2.0)
+            cost = dist + 0.15 * heading_penalty
+            return points, motion_sign, cost
+
+        tangent_len = max(0.35, min(2.8, 0.45 * dist + 0.28 * heading_penalty))
+        ctrl1 = (
+            x0 + tangent_len * math.cos(motion_yaw0),
+            y0 + tangent_len * math.sin(motion_yaw0),
+        )
+        ctrl2 = (
+            x1 - tangent_len * math.cos(motion_yaw1),
+            y1 - tangent_len * math.sin(motion_yaw1),
+        )
+        points = self._sample_cubic_bezier((x0, y0), ctrl1, ctrl2, (x1, y1))
+        path_len = self._path_length(points)
+        if path_len <= 1e-6:
+            return None
+        reverse_penalty = 0.08 if motion_sign < 0 else 0.0
+        cost = path_len + 0.55 * heading_penalty + reverse_penalty
+        return points, motion_sign, cost
+
+    def plan_transition_path(
+        self,
+        start_pose: Tuple[float, float, float],
+        end_pose: Tuple[float, float, float],
+        start_speed_mps: float,
+        end_speed_mps: float,
+        close_threshold_m: float = 0.5,
+    ) -> Tuple[List[PathPoint], List[PathSegmentRange]]:
+        x0, y0, _ = start_pose
+        x1, y1, _ = end_pose
+        dist = math.hypot(x1 - x0, y1 - y0)
+        if dist <= 1e-6:
+            return [], []
+
+        candidates = []
+        for motion_sign in (1, -1):
+            candidate = self._plan_transition_candidate(
+                start_pose=start_pose,
+                end_pose=end_pose,
+                motion_sign=motion_sign,
+                close_threshold_m=close_threshold_m,
+            )
+            if candidate is not None:
+                candidates.append(candidate)
+        if not candidates:
+            points = self._sample_line((x0, y0), (x1, y1), step=0.3)
+            motion_sign = 1
+        else:
+            points, motion_sign, _ = min(candidates, key=lambda item: item[2])
+        if len(points) < 2:
+            return [], []
+
+        transition_len = self._path_length(points)
+        transition_speed = max(
+            0.18,
+            min(
+                max(abs(float(start_speed_mps)), abs(float(end_speed_mps)), 0.25),
+                0.9,
+            ),
+        )
+        accel_dist = min(0.8, max(0.2, 0.25 * transition_len))
+        decel_dist = min(0.8, max(0.2, 0.25 * transition_len))
+        ranges: List[PathSegmentRange] = [
+            (
+                0,
+                len(points) - 1,
+                motion_sign,
+                False,
+                transition_speed,
+                accel_dist,
+                decel_dist,
+            )
+        ]
+        return points, ranges
+
+    @staticmethod
+    def _append_points_and_ranges(
+        base_points: List[PathPoint],
+        base_ranges: List[PathSegmentRange],
+        append_points: List[PathPoint],
+        append_ranges: List[PathSegmentRange],
+    ) -> None:
+        if not append_points:
+            return
+        if not base_points:
+            base_points.extend((float(x), float(y)) for x, y in append_points)
+            base_ranges.extend(append_ranges)
+            return
+
+        skip_first = (
+            math.hypot(
+                base_points[-1][0] - append_points[0][0],
+                base_points[-1][1] - append_points[0][1],
+            )
+            <= 1e-6
+        )
+        offset = len(base_points) - 1 if skip_first else len(base_points)
+        if skip_first:
+            base_points.extend((float(x), float(y)) for x, y in append_points[1:])
+        else:
+            base_points.extend((float(x), float(y)) for x, y in append_points)
+        for start_idx, end_idx, speed_sign, rcs_start, speed_mps, accel_dist, decel_dist in append_ranges:
+            base_ranges.append(
+                (
+                    offset + int(start_idx),
+                    offset + int(end_idx),
+                    int(speed_sign),
+                    bool(rcs_start),
+                    float(speed_mps),
+                    float(accel_dist),
+                    float(decel_dist),
+                )
+            )
+
+    def build_task_queue_plan(
+        self,
+        tasks: List[QueuedPathTask],
+        close_threshold_m: float = 0.5,
+    ) -> PlannedTaskSequence:
+        valid_tasks: List[QueuedPathTask] = []
+        for task in tasks:
+            local_points = [(float(x), float(y)) for x, y in task.local_points]
+            if len(local_points) < 2:
+                continue
+            valid_tasks.append(
+                QueuedPathTask(
+                    name=str(task.name),
+                    local_points=local_points,
+                    ranges=self._ensure_task_ranges(local_points, list(task.ranges or [])),
+                )
+            )
+        if not valid_tasks:
+            return PlannedTaskSequence([], [], [], [], 0, [])
+
+        combined_points: List[PathPoint] = []
+        combined_ranges: List[PathSegmentRange] = []
+        range_task_names: List[Optional[str]] = []
+        transition_pairs: List[Tuple[str, str]] = []
+
+        first_task = valid_tasks[0]
+        self._append_points_and_ranges(
+            combined_points,
+            combined_ranges,
+            first_task.local_points,
+            first_task.ranges,
+        )
+        range_task_names.extend([first_task.name] * len(first_task.ranges))
+
+        for idx in range(1, len(valid_tasks)):
+            prev_task = valid_tasks[idx - 1]
+            next_task = valid_tasks[idx]
+            prev_end_pose = self._path_pose(prev_task.local_points, at_start=False)
+            next_start_pose = self._path_pose(next_task.local_points, at_start=True)
+            transition_points, transition_ranges = self.plan_transition_path(
+                start_pose=prev_end_pose,
+                end_pose=next_start_pose,
+                start_speed_mps=self._task_end_speed_abs(prev_task.ranges),
+                end_speed_mps=self._task_start_speed_abs(next_task.ranges),
+                close_threshold_m=close_threshold_m,
+            )
+            if transition_points and transition_ranges:
+                self._append_points_and_ranges(
+                    combined_points,
+                    combined_ranges,
+                    transition_points,
+                    transition_ranges,
+                )
+                range_task_names.extend([None] * len(transition_ranges))
+                transition_pairs.append((prev_task.name, next_task.name))
+            self._append_points_and_ranges(
+                combined_points,
+                combined_ranges,
+                next_task.local_points,
+                next_task.ranges,
+            )
+            range_task_names.extend([next_task.name] * len(next_task.ranges))
+
+        return PlannedTaskSequence(
+            task_names=[task.name for task in valid_tasks],
+            local_points=combined_points,
+            ranges=combined_ranges,
+            range_task_names=range_task_names,
+            transition_count=len(transition_pairs),
+            transition_pairs=transition_pairs,
+        )
 
     def execute_line_movement(self, parent_window, dist: float, speed: float) -> None:
         """执行直线运动"""
@@ -155,13 +612,26 @@ class MainController:
             t = threading.Thread(
                 target=self.car.move_straight,
                 args=(dist, speed),
+                kwargs={
+                    "metrics_callback": getattr(parent_window, "_emit_tracking_metrics", None),
+                    "sample_callback": getattr(parent_window, "_append_tracking_sample", None),
+                    "run_label": "直线",
+                },
                 daemon=True,
             )
             t.start()
         else:
             QtWidgets.QMessageBox.warning(parent_window, "定位无效", "无法获取当前位姿，请检查 IMU/GNSS 连接。")
 
-    def execute_circle_movement(self, parent_window, radius: float, angle: float, speed: float) -> None:
+    def execute_circle_movement(
+        self,
+        parent_window,
+        radius: float,
+        angle: float,
+        speed: float,
+        *,
+        clockwise: Optional[bool] = None,
+    ) -> None:
         """执行圆周运动"""
         if not self.ensure_car_ready(parent_window):
             return
@@ -176,15 +646,36 @@ class MainController:
             QtWidgets.QMessageBox.warning(parent_window, "参数错误", "线速度必须为正值。")
             return
 
+        circle_plan = self.evaluate_circle_motion(radius, speed)
+        speed = float(circle_plan["adjusted_speed_mps"])
+        if speed <= 0:
+            QtWidgets.QMessageBox.warning(parent_window, "参数错误", "圆周运动速度无效。")
+            return
+        if bool(circle_plan["adjusted"]):
+            print(
+                "[MainController] Circle motion speed adjusted for feasibility: "
+                f"R={float(circle_plan['radius_m']):.2f}m, "
+                f"v={float(circle_plan['requested_speed_mps']):.2f}->{speed:.2f}m/s, "
+                f"nominal |w|={float(circle_plan['requested_nominal_w_radps']):.2f}"
+                f"->{float(circle_plan['adjusted_nominal_w_radps']):.2f}rad/s"
+            )
+
         # 基于当前位置生成规划圆周轨迹
         pose = get_robot_pose()
         if pose is not None:
-            clockwise = angle > 0  # 正角度为顺时针
+            if clockwise is None:
+                clockwise = angle > 0
+            clockwise = bool(clockwise)
             self._update_planned_circle(parent_window, pose, radius, abs(angle), clockwise)
-            # 启动圆周运动线程
+            # 启动圆周运动线程（极坐标轨道控制）
             t = threading.Thread(
-                target=self.car.move_circle,
+                target=self.car.move_circle_orbit,
                 args=(radius, angle, speed, clockwise),
+                kwargs={
+                    "metrics_callback": getattr(parent_window, "_emit_tracking_metrics", None),
+                    "sample_callback": getattr(parent_window, "_append_tracking_sample", None),
+                    "run_label": "圆周",
+                },
                 daemon=True,
             )
             t.start()
@@ -213,12 +704,6 @@ class MainController:
             f"当前航向角: {pose.yaw:.3f} rad ({yaw_deg:.1f}°)\n"
             f"东向: {math.cos(pose.yaw):.3f}, 北向: {math.sin(pose.yaw):.3f}"
         )
-
-    def emergency_stop(self, parent_window) -> None:
-        """紧急停止"""
-        if self.car is not None:
-            self.car.emergency_stop()
-            QtWidgets.QMessageBox.information(parent_window, "已停止", "小车已紧急停止。")
 
     def select_radar_target(self, parent_window) -> None:
         """Select a stable radar target for RCS recording."""
@@ -251,15 +736,16 @@ class MainController:
         self._radar_selected_id = int(oid)
 
     def load_path_file(self, parent_window) -> None:
-        """加载路径文件"""
-        pose = get_robot_pose()
-        if pose is None:
-            QtWidgets.QMessageBox.warning(parent_window, "定位无效", "当前未获取有效 GNSS / INS 位姿，无法将轨迹对齐到车头。")
-            return
+        """
+        加载路径文件。
 
+        文件中 x、y（米）与 imu_gnss_pose.get_robot_pose() 使用同一套校准后平面坐标：
+        原点在 ENU 校准原点，轴向与界面轨迹图一致（通常 X 东向、Y 北向），
+        不按车头旋转，也不平移到“当前车位”。
+        """
         filename, _ = QtWidgets.QFileDialog.getOpenFileName(
             parent_window,
-            "选择轨迹文件（车辆坐标系，单位 m）",
+            "选择轨迹文件（校准局部坐标系，单位 m）",
             "",
             "CSV / 文本 (*.csv *.txt);;所有文件 (*)",
         )
@@ -291,18 +777,29 @@ class MainController:
         parent_window.loaded_path_local_points = list(raw_points)
         if hasattr(parent_window, "_planned_ranges"):
             parent_window._planned_ranges = None
+        if hasattr(parent_window, "_planned_range_task_names"):
+            parent_window._planned_range_task_names = []
 
-        cos_yaw = math.cos(pose.yaw)
-        sin_yaw = math.sin(pose.yaw)
-        global_points = []
-        for xr, yr in raw_points:
-            gx = pose.x + xr * cos_yaw - yr * sin_yaw
-            gy = pose.y + xr * sin_yaw + yr * cos_yaw
-            global_points.append((gx, gy))
+        # 与预设轨迹里 rotate_with_yaw=False 的语义一致：直接使用局部平面坐标作为跟踪路径
+        path_points = [(float(x), float(y)) for x, y in raw_points]
+        if hasattr(parent_window, "_loaded_path_frame"):
+            f = parent_window._loaded_path_frame
+            if not f.is_fixed_origin() and hasattr(
+                parent_window, "_use_calibration_plane_path_origin"
+            ):
+                parent_window._use_calibration_plane_path_origin()
+            elif not f.is_fixed_origin():
+                f.origin_key = ""
+                f.origin_label = ""
+                f.origin_x_m = 0.0
+                f.origin_y_m = 0.0
+                f.origin_z_m = 0.0
+        if hasattr(parent_window, "_path_preview_uses_virtual_pose"):
+            parent_window._path_preview_uses_virtual_pose = False
 
-        parent_window.loaded_path_points = global_points
-        parent_window.planned_x = [p[0] for p in global_points]
-        parent_window.planned_y = [p[1] for p in global_points]
+        parent_window.loaded_path_points = path_points
+        parent_window.planned_x = [p[0] for p in path_points]
+        parent_window.planned_y = [p[1] for p in path_points]
         parent_window.traj_planned_curve.setData(parent_window.planned_x, parent_window.planned_y)
 
         if parent_window.planned_x and parent_window.planned_y:
@@ -311,16 +808,35 @@ class MainController:
             margin = 0.5
             parent_window.traj_plot.setXRange(min_x - margin, max_x + margin, padding=0)
             parent_window.traj_plot.setYRange(min_y - margin, max_y + margin, padding=0)
-        parent_window.btn_run_path.setEnabled(True)
+        if hasattr(parent_window, "_update_path_coordinate_widgets"):
+            parent_window._update_path_coordinate_widgets(
+                frame_override=getattr(parent_window, "_loaded_path_frame", None)
+            )
+        if hasattr(parent_window, "_update_run_path_button_state"):
+            parent_window._update_run_path_button_state()
+        else:
+            parent_window.btn_run_path.setEnabled(True)
+
+        ins_hint = ""
+        if get_robot_pose() is None:
+            ins_hint = "\n\n当前尚无有效位姿；执行轨迹前请等待 INS 可用。"
 
         QtWidgets.QMessageBox.information(
             parent_window,
             "加载成功",
-            f"已读取 {len(global_points)} 个轨迹点。\n"
-            "说明：文件中的 x、y 单位为米，默认为车辆坐标系（x 向前、y 向左），已按当前车头姿态转换到 ENU 全局坐标。",
+            f"已读取 {len(path_points)} 个轨迹点。\n"
+            "说明：坐标为校准后局部平面（与 get_robot_pose 一致），"
+            "例如 (0,0)→(0,10) 为沿 +Y 走 10m，(0,0)→(5,5) 为沿 XY 45° 方向。"
+            f"{ins_hint}",
         )
 
-    def execute_loaded_path(self, parent_window, speed: float) -> None:
+    def execute_loaded_path(
+        self,
+        parent_window,
+        speed: float,
+        tracking_mode: str = "pid",
+        tracking_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """执行已加载的路径"""
         if not self.ensure_car_ready(parent_window):
             return
@@ -331,55 +847,163 @@ class MainController:
             QtWidgets.QMessageBox.warning(parent_window, "参数错误", "线速度必须为正值。")
             return
 
+        path_tracking_kwargs = dict(tracking_kwargs or {})
+        path_tracking_kwargs.setdefault(
+            "record_context",
+            {
+                "segment_index": 1,
+                "segment_kind": "path",
+                "segment_trajectory_name": "整条轨迹",
+                "segment_start_idx": 0,
+                "segment_end_idx": max(0, len(parent_window.loaded_path_points) - 1),
+                "segment_cruise_speed_mps": float(speed),
+            },
+        )
+        follow_kw: Dict[str, Any] = {
+            "tracking_mode": tracking_mode,
+            "metrics_callback": getattr(parent_window, "_emit_tracking_metrics", None),
+            "sample_callback": getattr(parent_window, "_append_tracking_sample", None),
+            "run_label": "整条轨迹",
+            "lookahead_distance": 0.6,
+            "max_w_rate": 3.0,
+            "max_w_step": 0.06,
+        }
+        # 纯 Stanley：略增大前视、限制单步角速度跳变，与 UI 侧较低 stanley_gain 配套
+        if tracking_mode == "stanley":
+            follow_kw["lookahead_distance"] = 0.78
+            follow_kw["max_w_rate"] = 2.6
+            follow_kw["max_w_step"] = 0.048
+        follow_kw.update(path_tracking_kwargs)
         t = threading.Thread(
             target=self.car.follow_path_with_pid,
             args=(parent_window.loaded_path_points, speed),
+            kwargs=follow_kw,
             daemon=True,
         )
-        print(f"[MainController] 使用PID控制执行路径跟踪，速度: {speed} m/s")
+        print(
+            f"[MainController] 使用 {tracking_mode} 控制执行路径跟踪，速度: {speed} m/s"
+        )
         t.start()
+
+    def get_power_snapshot(self) -> Dict[str, Dict[str, Any]]:
+        snapshot: Dict[str, Dict[str, Any]] = {
+            "pi": {
+                "name": "树莓派",
+                "available": False,
+                "percent": None,
+                "voltage": None,
+                "power": None,
+                "status": "unavailable",
+                "text": "树莓派电量: 不可用",
+            },
+            "car": {
+                "name": "小车底盘",
+                "available": False,
+                "percent": None,
+                "voltage": None,
+                "power": None,
+                "status": "unavailable",
+                "mode": None,
+                "mode_text": "--",
+                "feedback_age_s": None,
+                "text": "小车电量: 不可用",
+            },
+        }
+
+        if self.pi_power is not None:
+            try:
+                if hasattr(self.pi_power, "available") and self.pi_power.available:
+                    p_status = self.pi_power.read_status()
+                    snapshot["pi"]["available"] = True
+                    if p_status is not None:
+                        snapshot["pi"].update(
+                            {
+                                "percent": float(p_status.percent),
+                                "voltage": float(p_status.voltage),
+                                "power": float(p_status.power),
+                                "status": "ok",
+                                "text": (
+                                    f"树莓派电量: {p_status.voltage:.2f} V "
+                                    f"({p_status.percent:.0f}%, {p_status.power:.2f} W)"
+                                ),
+                            }
+                        )
+                    else:
+                        snapshot["pi"]["status"] = "read_failed"
+                        snapshot["pi"]["text"] = "树莓派电量: 读取失败"
+            except Exception as e:
+                print(f"[MainController] 读取树莓派电量失败: {e}")
+                snapshot["pi"]["status"] = "read_error"
+                snapshot["pi"]["text"] = "树莓派电量: 读取异常"
+
+        if self.car is not None:
+            snapshot["car"]["available"] = True
+            try:
+                st = self.car.get_status()
+                mode = int(st.control_mode)
+                mode_text = self._describe_car_control_mode(mode)
+                sys_status_ts = float(getattr(st, "sys_status_update", 0.0) or 0.0)
+                feedback_age_s = None
+                if sys_status_ts > 0.0:
+                    feedback_age_s = max(0.0, time.time() - sys_status_ts)
+
+                snapshot["car"].update(
+                    {
+                        "mode": mode,
+                        "mode_text": mode_text,
+                        "feedback_age_s": feedback_age_s,
+                    }
+                )
+
+                if sys_status_ts <= 0.0:
+                    snapshot["car"]["status"] = "no_feedback"
+                    snapshot["car"]["text"] = "小车电量: 未收到 0x211 系统状态反馈"
+                elif feedback_age_s is not None and feedback_age_s > 1.5:
+                    snapshot["car"]["status"] = "stale"
+                    snapshot["car"]["text"] = (
+                        f"小车电量: 0x211 反馈过期 ({feedback_age_s:.1f} s)"
+                    )
+                elif st.battery_voltage <= 1e-3:
+                    snapshot["car"]["status"] = "invalid"
+                    snapshot["car"]["text"] = "小车电量: 0x211 已收到，但电压字段无效"
+                else:
+                    percent = self._estimate_car_battery_percent(float(st.battery_voltage))
+                    base_text = f"小车电量: {st.battery_voltage:.1f} V"
+                    if percent is not None:
+                        base_text += f" ({percent:.0f}%)"
+
+                    status = "ok"
+                    if mode == 0:
+                        status = "standby"
+                        base_text += " | 模式: 待机，需先发送 0x421 使能 CAN"
+                    elif mode == 1:
+                        base_text += " | 模式: CAN"
+                    elif mode == 3:
+                        status = "remote"
+                        base_text += " | 模式: 遥控优先"
+                    else:
+                        status = "mode_unknown"
+                        base_text += f" | 模式: {mode_text}"
+
+                    snapshot["car"].update(
+                        {
+                            "percent": percent,
+                            "voltage": float(st.battery_voltage),
+                            "status": status,
+                            "text": base_text,
+                        }
+                    )
+            except Exception as e:
+                print(f"[MainController] 读取小车电量失败: {e}")
+                snapshot["car"]["status"] = "read_error"
+                snapshot["car"]["text"] = "小车电量: 读取异常"
+
+        return snapshot
 
     def get_power_status(self) -> Tuple[str, str]:
         """获取电源状态"""
-        pi_text = "树莓派电量: 不可用"
-        if self.pi_power is not None:
-            try:
-                # 检查是否有可用的电源监控
-                if hasattr(self.pi_power, 'available') and self.pi_power.available:
-                    p_status = self.pi_power.read_status()
-                    if p_status is not None:
-                        pi_text = (
-                            f"树莓派电量: {p_status.voltage:.2f} V "
-                            f"({p_status.percent:.0f}%, {p_status.power:.2f} W)"
-                        )
-                    else:
-                        pi_text = "树莓派电量: 读取失败"
-            except Exception as e:
-                print(f"[MainController] 读取树莓派电量失败: {e}")
-                pi_text = "树莓派电量: 读取异常"
-
-        car_text = "小车电量: 不可用"
-        if self.car is not None:
-            try:
-                st = self.car.get_status()
-                if st.battery_voltage > 1e-3:
-                    percent = None
-                    if self._car_batt_v_max > self._car_batt_v_min:
-                        percent = (st.battery_voltage - self._car_batt_v_min) / (
-                            self._car_batt_v_max - self._car_batt_v_min
-                        ) * 100.0
-                        percent = max(0.0, min(100.0, percent))
-                    if percent is None:
-                        car_text = f"小车电量: {st.battery_voltage:.1f} V"
-                    else:
-                        car_text = f"小车电量: {st.battery_voltage:.1f} V ({percent:.0f}%)"
-                else:
-                    car_text = "小车电量: 无反应"
-            except Exception as e:
-                print(f"[MainController] 读取小车电量失败: {e}")
-                car_text = "小车电量: 读取异常"
-
-        return pi_text, car_text
+        snapshot = self.get_power_snapshot()
+        return snapshot["pi"]["text"], snapshot["car"]["text"]
 
     def get_can_status(self) -> str:
         """获取CAN状态"""
@@ -439,7 +1063,7 @@ class MainController:
             return
 
         x0, y0, yaw = pose.x, pose.y, pose.yaw
-        n = 50
+        n = max(1, STRAIGHT_POINT_COUNT - 1)
         for i in range(n + 1):
             s = dist_m * i / n
             x = x0 + s * math.cos(yaw)

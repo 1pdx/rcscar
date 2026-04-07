@@ -331,19 +331,38 @@ class RadarObjectTracker:
             results.append(tr.last)
         return results
 
-    def get_best_stable_target(self, min_score: Optional[float] = None) -> Optional[ObjMeas]:
-        targets = self.get_targets_snapshot(min_score=min_score)
-        if not targets:
-            return None
-        best = None
+    def get_best_stable_target(
+        self,
+        min_score: Optional[float] = None,
+        max_age_s: Optional[float] = None,
+        exclude_oid: Optional[int] = None,
+    ) -> Optional[ObjMeas]:
+        now = time.time()
+        score_th = self.stable_min_score if min_score is None else float(min_score)
+        exclude_oid_int = int(exclude_oid) if exclude_oid is not None else None
+
+        best: Optional[ObjMeas] = None
         best_score = -1.0
-        track_map = {tr.oid: tr for tr in self.tracker.snapshot_tracks() if tr.last is not None}
-        for t in targets:
-            tr = track_map.get(t.oid)
-            score = tr.stability_score() if tr is not None else 0.0
-            if score > best_score:
+        best_update = -1.0
+        for tr in self.tracker.snapshot_tracks():
+            if tr.last is None:
+                continue
+            if self.front_only and tr.last.x < 0.0:
+                continue
+            if exclude_oid_int is not None and int(tr.last.oid) == exclude_oid_int:
+                continue
+            score = tr.stability_score()
+            if tr.age < self.stable_min_age or score < score_th:
+                continue
+            age_s = max(0.0, now - float(tr.last_update or 0.0))
+            if max_age_s is not None and age_s > float(max_age_s):
+                continue
+            if score > best_score or (
+                abs(score - best_score) <= 1e-9 and float(tr.last_update or 0.0) > best_update
+            ):
+                best = tr.last
                 best_score = score
-                best = t
+                best_update = float(tr.last_update or 0.0)
         return best
 
 
@@ -360,16 +379,16 @@ class CurvePoint:
 
 
 class RcsRunRecorder:
-    def __init__(self, max_segments: int = 10):
-        self.max_segments = int(max_segments)
+    def __init__(self, max_segments: int = 0, dist_bin_m: float = 0.05):
+        # Keep max_segments only for backward compatibility; recording is now continuous.
+        self.max_segments = int(max_segments) if max_segments is not None else 0
+        self.dist_bin_m = max(float(dist_bin_m), 1e-3)
         self.reset()
 
     def reset(self):
         self.oid_hint: Optional[int] = None
         self.segments: List[List[CurvePoint]] = []
         self._cur: List[CurvePoint] = []
-        self._last_front: Optional[float] = None
-        self._dir: int = 0
         self._ended = False
         self._rcs_ema: Optional[float] = None
 
@@ -392,66 +411,70 @@ class RcsRunRecorder:
         if self._ended:
             return
         r = m.rng
-        front = m.x
         if self._rcs_ema is None:
             self._rcs_ema = m.rcs_db
         else:
             self._rcs_ema = 0.85 * self._rcs_ema + 0.15 * m.rcs_db
         pt = CurvePoint(t=m.t, x=m.x, y=m.y, r_raw=r, rcs_raw=m.rcs_db, rcs_filt=float(self._rcs_ema))
-
         self.oid_hint = int(m.oid)
-
-        if self._last_front is None:
-            self._last_front = front
-            return
-
-        d_front = front - self._last_front
-        self._last_front = front
-
-        th = 0.25
-        new_dir = 0
-        if d_front > th:
-            new_dir = +1
-        elif d_front < -th:
-            new_dir = -1
-
-        min_pts = 25
-        if new_dir != 0 and new_dir != self._dir:
-            if self._dir == -1 and len(self._cur) >= min_pts:
-                self.segments.append(self._cur)
-                if len(self.segments) >= self.max_segments:
-                    self._ended = True
-                    self._cur = []
-                    self._dir = new_dir
-                    return
-            self._cur = []
-            self._dir = new_dir
-            if self._dir == -1:
-                self._cur.append(pt)
-            return
-
-        if self._dir == 0 and new_dir != 0:
-            self._dir = new_dir
-            if self._dir == -1:
-                self._cur.append(pt)
-            return
-
-        if self._dir == -1:
-            self._cur.append(pt)
+        self._cur.append(pt)
 
     def finalize(self):
         if self._cur:
-            self.segments.append(self._cur)
+            self.segments = [list(self._cur)]
             self._cur = []
-        self.segments = self.segments[:self.max_segments]
         self._ended = True
 
+    def point_count(self) -> int:
+        return len(self._all_points(include_live=True))
+
+    def _all_points(self, include_live: bool = True) -> List[CurvePoint]:
+        points: List[CurvePoint] = []
+        for seg in self.segments:
+            points.extend(seg)
+        if include_live and self._cur:
+            points.extend(self._cur)
+        return points
+
+    def _distance_mean_xy(
+        self,
+        x_min: Optional[float] = None,
+        x_max: Optional[float] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        points = self._all_points(include_live=True)
+        if not points:
+            return np.asarray([], dtype=float), np.asarray([], dtype=float)
+
+        x = np.asarray([p.x for p in points], dtype=float)
+        y = np.asarray([p.rcs_filt for p in points], dtype=float)
+        if x_min is not None and x_max is not None:
+            mask = (x >= x_min) & (x <= x_max)
+            x = x[mask]
+            y = y[mask]
+        if x.size == 0:
+            return np.asarray([], dtype=float), np.asarray([], dtype=float)
+
+        bin_ids = np.round(x / self.dist_bin_m).astype(np.int64)
+        uniq_bins = np.unique(bin_ids)
+        x_mean = []
+        y_mean = []
+        for bid in uniq_bins:
+            mask = bin_ids == bid
+            x_mean.append(float(np.mean(x[mask])))
+            y_mean.append(float(np.mean(y[mask])))
+
+        x_out = np.asarray(x_mean, dtype=float)
+        y_out = np.asarray(y_mean, dtype=float)
+        order = np.argsort(x_out)
+        return x_out[order], y_out[order]
+
     def raw_text(self) -> str:
-        lines = ["# segment_idx	t(s)	x(m)	y(m)	rcs(dBsm)"]
-        for si, seg in enumerate(self.segments):
+        lines = ["# segment_idx\tt(s)\tx(m)\ty(m)\trcs(dBsm)"]
+        segs = self.segments if self.segments else ([self._cur] if self._cur else [])
+        for si, seg in enumerate(segs):
             for p in seg:
-                lines.append(f"{si}	{p.t:.6f}	{p.x:.3f}	{p.y:.3f}	{p.rcs_raw:.3f}")
-        return "".join(lines)
+                lines.append(f"{si}\t{p.t:.6f}\t{p.x:.3f}\t{p.y:.3f}\t{p.rcs_raw:.3f}")
+        return "\n".join(lines) + ("\n" if lines else "")
 
     def fitted_curve(self, grid: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         x_min = float(np.min(grid)) if grid.size else None
@@ -459,75 +482,32 @@ class RcsRunRecorder:
         fit = self.fit_curve(x_min=x_min, x_max=x_max)
         if fit is None:
             return grid, np.full_like(grid, np.nan, dtype=float)
-        coeffs, x_mean, x_scale = fit
-        x_scale = max(x_scale, 1e-6)
-        xn = (grid - x_mean) / x_scale
-        return grid, np.polyval(coeffs, xn)
+        x_fit, y_fit = fit
+        y_out = np.full_like(grid, np.nan, dtype=float)
+        if x_fit.size == 1:
+            if grid.size:
+                idx = int(np.argmin(np.abs(grid - float(x_fit[0]))))
+                y_out[idx] = float(y_fit[0])
+            return grid, y_out
+
+        span_mask = (grid >= float(x_fit[0])) & (grid <= float(x_fit[-1]))
+        if np.any(span_mask):
+            y_out[span_mask] = np.interp(grid[span_mask], x_fit, y_fit)
+        return grid, y_out
 
     def fit_curve(
         self,
         x_min: Optional[float] = None,
         x_max: Optional[float] = None,
-    ) -> Optional[Tuple[np.ndarray, float, float]]:
-        if not self.segments:
+    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        x, y = self._distance_mean_xy(x_min=x_min, x_max=x_max)
+        if x.size == 0:
             return None
-        xs = []
-        ys = []
-        for seg in self.segments:
-            for p in seg:
-                xs.append(p.x)
-                ys.append(p.rcs_filt)
-        min_pts = 8
-        if len(xs) < min_pts:
-            return None
-        x = np.asarray(xs, dtype=float)
-        y = np.asarray(ys, dtype=float)
-        if x_min is not None and x_max is not None:
-            mask = (x >= x_min) & (x <= x_max)
-            x = x[mask]
-            y = y[mask]
-        if len(x) < min_pts:
-            return None
-        if np.ptp(x) < 1.0:
-            return None
-
-        order = np.argsort(x)
-        x = x[order]
-        y = y[order]
-
-        if len(x) > 200:
-            idx = np.linspace(0, len(x) - 1, 200).astype(int)
-            x = x[idx]
-            y = y[idx]
-
-        x_mean = float(np.mean(x))
-        x_scale = float(np.std(x))
-        if x_scale < 1e-6:
-            return None
-
-        deg = 3
-        if len(x) < 8:
-            deg = 2
-        if len(x) < deg + 1:
-            return None
-
-        coeffs = np.polyfit((x - x_mean) / x_scale, y, deg)
-        return coeffs, x_mean, x_scale
+        return x, y
 
     def fit_line(self) -> Optional[Tuple[float, float]]:
-        if not self.segments:
-            return None
-        xs = []
-        ys = []
-        for seg in self.segments:
-            for p in seg:
-                xs.append(p.x)
-                ys.append(p.rcs_filt)
-        if len(xs) < 10:
-            return None
-        x = np.asarray(xs, dtype=float)
-        y = np.asarray(ys, dtype=float)
-        if np.ptp(x) < 1.0:
+        x, y = self._distance_mean_xy()
+        if x.size < 2:
             return None
         coef = np.polyfit(x, y, 1)
         return float(coef[0]), float(coef[1])

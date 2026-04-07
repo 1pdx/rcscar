@@ -3,11 +3,43 @@ import os
 import threading
 import time
 from dataclasses import dataclass
-from typing import Optional, Callable, List, Tuple
+from typing import Any, Dict, Optional, Callable, List, Tuple
 
 import can
 
 from imu_gnss_pose import get_robot_pose, PoseSolution
+
+#
+# UI 侧会导入该常量用于复用直线前进段的跟踪参数。
+# 若需要调整直线前进段参数，请优先改这里并同步相关调用处。
+#
+FORWARD_STRAIGHT_TRACKING_KWARGS: Dict[str, Any] = {
+    "lookahead_distance": 0.44,
+    "stanley_gain": 0.1,
+    "stanley_softening_speed_mps": 0.55,
+    "straight_switch_pause_s": 0.12,
+    "stanley_lateral_pd_kp": 0.04,
+    "stanley_lateral_pd_kd": 0.0,
+    "speed_pid_kp": 0.95,
+    "speed_pid_ki": 0.20,
+    "speed_pid_kd": 0.03,
+    "speed_pid_output_limit_mps": 0.45,
+    "lateral_pid_kp": 2.08,
+    "lateral_pid_ki": 0.50,
+    "lateral_pid_kd": 0.42,
+    "heading_pid_kp": 1.58,
+    "heading_pid_ki": 0.25,
+    "heading_pid_kd": 0.44,
+    "yaw_rate_pid_kp": 0.42,
+    "yaw_rate_pid_ki": 0.07,
+    "yaw_rate_pid_kd": 0.0,
+    "max_w_rate": 2.05,
+    "max_w_step": 0.031,
+    "smoothing_strength": 0.76,
+    "smoothing_strength_curve": 0.88,
+    "w_bias_tau": 0.95,
+    "w_bias_hf_gain": 0.16,
+}
 
 
 @dataclass
@@ -114,6 +146,23 @@ class ScoutMiniCAN:
     # 这里用手册给出的最大线/角速度做饱和值
     MAX_LINEAR_MPS = 3.0          # m/s
     MAX_ANGULAR_RADPS = 2.5       # rad/s
+
+    def _is_nearly_straight_segment(self, waypoints: List[Tuple[float, float]]) -> bool:
+        if len(waypoints) < 3:
+            return True
+        x0, y0 = waypoints[0]
+        x1, y1 = waypoints[-1]
+        chord = math.hypot(x1 - x0, y1 - y0)
+        if chord <= 1e-6:
+            return True
+        max_cross = 0.0
+        dx = x1 - x0
+        dy = y1 - y0
+        for x, y in waypoints[1:-1]:
+            cross = abs(dx * (y - y0) - dy * (x - x0))
+            max_cross = max(max_cross, cross)
+        max_dev = max_cross / chord
+        return max_dev <= 0.06
 
     def __init__(
         self,
@@ -368,11 +417,23 @@ class ScoutMiniCAN:
             f"yaw={yaw0:.3f} rad, dist={distance_m:.2f} m"
         )
 
+        # 直线段：略增大到达阈值，减少“判到达瞬间仍在动”导致的过冲；
+        # 同时启用 slow_down_dist，在终点前按距离线性压低期望速度。
+        straight_arrival_dist_m = 0.20
+        slow_down_dist = min(
+            path_len * 0.55,
+            max(0.75, 0.85 * speed_abs + 0.45),
+        )
+        slow_down_dist = max(slow_down_dist, 2.0 * straight_arrival_dist_m)
+        slow_down_dist = min(slow_down_dist, path_len * 0.65)
+
         self.follow_path_with_pid(
             waypoints=waypoints,
             speed_mps=speed_cmd,
             dt=dt,
             update_pose=update_pose,
+            arrival_dist=straight_arrival_dist_m,
+            slow_down_dist=slow_down_dist,
         )
 
     def move_circle(
@@ -464,6 +525,356 @@ class ScoutMiniCAN:
             max_w_rate=3.0,
         )
 
+    def move_circle_orbit(
+        self,
+        radius_m: float,
+        angle_deg: float = 360.0,
+        speed_mps: float = 0.5,
+        clockwise: bool = False,
+        dt: float = 0.02,
+        update_pose: Callable[[], Optional[PoseSolution]] = get_robot_pose,
+        *,
+        k_heading: float = 0.1,
+        k_radius: float = 0.25,
+        k_radius_d: float = 0.5,
+        enable_speed_gain_scheduling: bool = True,
+        speed_gain_reference_mps: float = 1.6,
+        k_heading_high_speed_scale: float = 0.65,
+        k_radius_high_speed_scale: float = 1.15,
+        k_radius_d_high_speed_scale: float = 1.45,
+        w_output_tau_high_speed_scale: float = 0.70,
+        max_w_step_high_speed_scale: float = 1.60,
+        enable_speed_scheduling: bool = True,
+        min_speed_scale: float = 0.35,
+        v_output_tau: float = 1.2,
+        w_output_tau: float = 0.15,
+        max_w_rate: float = 3.0,
+        max_w_step: Optional[float] = 0.04,
+        w_bias_tau: float = 0.9,
+        w_bias_hf_gain: float = 0.22,
+        metrics_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        sample_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        run_label: Optional[str] = None,
+        record_context: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        圆周/圆弧运动（极坐标轨道控制）。
+
+        控制变量:
+          - 半径误差 e_r = current_r - R
+          - 航向误差 e_psi = wrap(psi_tangent - psi_motion)
+
+        控制律（简化）:
+          w_cmd = sign * (v/R + k_radius * e_r) + k_heading * e_psi
+          其中 sign: CCW=+1, CW=-1
+        """
+        self._stop_flag.clear()
+        started_wall_ts = time.time()
+        run_key = f"{started_wall_ts:.6f}|{str(run_label or '圆周').strip() or '圆周'}"
+
+        radius_m = max(0.1, abs(float(radius_m)))
+        angle_deg = abs(float(angle_deg))
+        speed_abs = abs(float(speed_mps))
+        if speed_abs <= 0.0 or angle_deg <= 0.0:
+            return
+
+        pose0 = update_pose()
+        if pose0 is None:
+            # 与 move_circle 保持一致：无位姿时退回“定 v,w 跑够时间”
+            total_angle_rad = math.radians(angle_deg)
+            w0 = speed_abs / radius_m
+            w_cmd = -w0 if clockwise else w0
+            v_cmd = speed_abs
+            t_total = total_angle_rad / max(1e-3, abs(w0))
+            t_start = time.time()
+            while not self._stop_flag.is_set():
+                if time.time() - t_start >= t_total:
+                    break
+                self._send_motion_command(v_cmd, w_cmd)
+                time.sleep(max(0.0, float(dt) if dt else 0.02))
+            self._send_motion_command(0.0, 0.0)
+            return
+
+        x0, y0, yaw0 = float(pose0.x), float(pose0.y), float(pose0.yaw)
+        if clockwise:
+            cx = x0 + radius_m * math.sin(yaw0)
+            cy = y0 - radius_m * math.cos(yaw0)
+            sign = -1.0
+        else:
+            cx = x0 - radius_m * math.sin(yaw0)
+            cy = y0 + radius_m * math.cos(yaw0)
+            sign = 1.0
+
+        total_angle_rad = math.radians(angle_deg)
+        prev_phi: Optional[float] = None
+        accum_angle = 0.0
+        dt_eff = float(dt) if dt and float(dt) > 0 else 0.02
+        k_radius_d = float(k_radius_d)
+        enable_speed_gain_scheduling = bool(enable_speed_gain_scheduling)
+        speed_gain_reference_mps = max(0.1, float(speed_gain_reference_mps))
+        k_heading_high_speed_scale = max(0.0, float(k_heading_high_speed_scale))
+        k_radius_high_speed_scale = max(0.0, float(k_radius_high_speed_scale))
+        k_radius_d_high_speed_scale = max(0.0, float(k_radius_d_high_speed_scale))
+        w_output_tau_high_speed_scale = max(0.15, float(w_output_tau_high_speed_scale))
+        max_w_step_high_speed_scale = max(0.2, float(max_w_step_high_speed_scale))
+        enable_speed_scheduling = bool(enable_speed_scheduling)
+        min_speed_scale = max(0.05, min(1.0, float(min_speed_scale)))
+        v_output_tau = max(0.0, float(v_output_tau))
+        w_output_tau = max(0.0, float(w_output_tau))
+        max_w_rate = max(0.1, float(max_w_rate))
+        max_w_step_val: Optional[float] = None
+        if max_w_step is not None:
+            try:
+                max_w_step_val = abs(float(max_w_step))
+            except (TypeError, ValueError):
+                max_w_step_val = None
+        w_bias_tau = max(0.05, float(w_bias_tau))
+        w_bias_hf_gain = max(0.0, min(1.0, float(w_bias_hf_gain)))
+
+        prev_cmd_w: Optional[float] = None
+        prev_output_w: Optional[float] = None
+        prev_output_v: Optional[float] = 0.0
+        w_bias: Optional[float] = None
+        prev_radius_error: Optional[float] = None
+        traveled = 0.0
+        last_pose: Optional[PoseSolution] = None
+        peak_abs_radius_error = 0.0
+        peak_abs_heading_error_deg = 0.0
+        peak_abs_cmd_w = 0.0
+        sample_count = 0
+        exit_reason = "loop_exit"
+        completed = False
+
+        print(
+            f"[ScoutMiniCAN] move_circle_orbit: center=({cx:.2f},{cy:.2f}), "
+            f"R={radius_m:.2f}m, angle={angle_deg:.1f}deg, cw={bool(clockwise)}"
+        )
+
+        while not self._stop_flag.is_set():
+            pose = update_pose()
+            if pose is None:
+                exit_reason = "pose_lost"
+                break
+            x, y, yaw = float(pose.x), float(pose.y), float(pose.yaw)
+            if last_pose is not None:
+                traveled += math.hypot(x - float(last_pose.x), y - float(last_pose.y))
+            last_pose = pose
+
+            dx = x - cx
+            dy = y - cy
+            r = math.hypot(dx, dy)
+            if r <= 1e-6:
+                exit_reason = "radius_invalid"
+                break
+            phi = math.atan2(dy, dx)
+
+            if prev_phi is None:
+                prev_phi = phi
+            else:
+                dphi = _wrap_angle(phi - prev_phi)
+                prev_phi = phi
+                accum_angle += sign * float(dphi)
+
+            if accum_angle >= total_angle_rad:
+                exit_reason = "goal_arrived"
+                completed = True
+                break
+
+            # 运动方向航向（倒车时使用 yaw+pi）
+            motion_yaw = yaw
+            if float(speed_mps) < 0.0:
+                motion_yaw = _wrap_angle(yaw + math.pi)
+
+            # 目标切向航向：CCW -> phi+pi/2, CW -> phi-pi/2
+            target_heading = _wrap_angle(phi + sign * (math.pi / 2.0))
+            heading_error = _wrap_angle(target_heading - motion_yaw)
+            radius_error = float(r - radius_m)
+
+            # 半径误差阻尼：用 e_r 的变化率抑制“越修越冲”的振荡
+            if prev_radius_error is None:
+                radius_error_rate = 0.0
+            else:
+                radius_error_rate = (radius_error - prev_radius_error) / max(1e-6, dt_eff)
+            prev_radius_error = float(radius_error)
+
+            # 误差大时自动降速：减少所需 w 与相位滞后引起的发散
+            speed_scale = 1.0
+            if enable_speed_scheduling:
+                # 航向误差与半径误差共同影响降速（半径误差按 0.25R 归一化，避免大半径过于敏感）
+                r_norm = max(0.15, 0.25 * radius_m)
+                e = abs(float(heading_error)) + abs(float(radius_error)) / r_norm
+                speed_scale = 1.0 / (1.0 + 1.6 * e)
+                speed_scale = max(min_speed_scale, min(1.0, float(speed_scale)))
+
+            desired_v = float(speed_abs) * float(speed_scale)
+
+            # 线速度输出软启动/平滑过渡（避免起步瞬间“冲”）
+            if prev_output_v is None or v_output_tau <= 1e-6:
+                out_v = float(desired_v)
+            else:
+                alpha_v = dt_eff / (v_output_tau + dt_eff)
+                out_v = (1.0 - alpha_v) * float(prev_output_v) + alpha_v * float(desired_v)
+            prev_output_v = float(out_v)
+
+            # 速度绑定参数（gain scheduling）
+            # speed_ratio≈0: 低速；≈1: 达到参考速度；>1: 视为 1
+            speed_ratio = min(1.0, abs(float(out_v)) / speed_gain_reference_mps)
+            if enable_speed_gain_scheduling:
+                # 高速时更容易出现“呼吸式”摆动：增强半径阻尼/适度增强半径P，
+                # 同时降低航向增益避免把航向噪声放大成 w 抖动；
+                # 输出更跟手：降低 w_output_tau，且放宽 max_w_step（但仍保留 max_w_rate 限制）。
+                k_heading_eff = float(k_heading) * (
+                    1.0 - (1.0 - k_heading_high_speed_scale) * speed_ratio
+                )
+                k_radius_eff = float(k_radius) * (
+                    1.0 + (k_radius_high_speed_scale - 1.0) * speed_ratio
+                )
+                k_radius_d_eff = float(k_radius_d) * (
+                    1.0 + (k_radius_d_high_speed_scale - 1.0) * speed_ratio
+                )
+                w_output_tau_eff = max(
+                    0.0,
+                    float(w_output_tau)
+                    * (1.0 - (1.0 - w_output_tau_high_speed_scale) * speed_ratio),
+                )
+                max_w_step_eff: Optional[float] = (
+                    float(max_w_step_val) * (1.0 + (max_w_step_high_speed_scale - 1.0) * speed_ratio)
+                    if max_w_step_val is not None
+                    else None
+                )
+            else:
+                k_heading_eff = float(k_heading)
+                k_radius_eff = float(k_radius)
+                k_radius_d_eff = float(k_radius_d)
+                w_output_tau_eff = float(w_output_tau)
+                max_w_step_eff = float(max_w_step_val) if max_w_step_val is not None else None
+
+            # 前馈角速度用“实际下发速度”计算，避免 v 软启动但 w 仍按标称 v/R 直接转入导致内切/误差放大
+            w_ff = sign * (abs(float(out_v)) / radius_m)
+            w_cmd = (
+                float(w_ff)
+                + float(k_radius_eff) * float(radius_error)
+                + float(k_radius_d_eff) * float(radius_error_rate)
+                + float(k_heading_eff) * float(heading_error)
+            )
+            w_cmd = _sat(w_cmd, -self.MAX_ANGULAR_RADPS, self.MAX_ANGULAR_RADPS)
+
+            # 稳态偏置 + 高频抑制（与 follow_path_with_pid 同型）
+            if w_bias is None:
+                w_bias = w_cmd
+            else:
+                beta = dt_eff / (w_bias_tau + dt_eff)
+                w_bias = (1.0 - beta) * w_bias + beta * w_cmd
+            desired_w = w_bias + (w_cmd - w_bias) * w_bias_hf_gain
+
+            # 限角加速度/步进
+            if prev_cmd_w is None:
+                cmd_w = desired_w
+            else:
+                dw_max = max_w_rate * dt_eff
+                if max_w_step_eff is not None:
+                    dw_max = min(dw_max, float(max_w_step_eff))
+                dw = desired_w - prev_cmd_w
+                if abs(dw) > dw_max:
+                    desired_w = prev_cmd_w + math.copysign(dw_max, dw)
+                cmd_w = desired_w
+            prev_cmd_w = cmd_w
+
+            # 角速度输出再做一次平滑过渡（降低跳变/抖动）
+            if prev_output_w is None or w_output_tau_eff <= 1e-6:
+                out_w = float(cmd_w)
+            else:
+                alpha = dt_eff / (w_output_tau_eff + dt_eff)
+                out_w = (1.0 - alpha) * float(prev_output_w) + alpha * float(cmd_w)
+            prev_output_w = float(out_w)
+
+            self._send_motion_command(out_v, out_w)
+
+            if callable(sample_callback):
+                try:
+                    now_ts = time.time()
+                    fb_v = 0.0
+                    fb_w = 0.0
+                    try:
+                        st = self.get_status()
+                        fb_v = float(getattr(st, "linear_speed", 0.0) or 0.0)
+                        fb_w = float(getattr(st, "angular_speed", 0.0) or 0.0)
+                    except Exception:
+                        fb_v = 0.0
+                        fb_w = 0.0
+                    payload: Dict[str, Any] = {
+                        "timestamp": float(now_ts),
+                        "relative_time_s": float(max(0.0, now_ts - started_wall_ts)),
+                        "run_key": str(run_key),
+                        "run_label": str(run_label or ""),
+                        "tracking_mode": "circle_orbit",
+                        "speed_sign": 1.0,
+                        "speed_mps": float(speed_abs),
+                        "nominal_speed_abs_mps": float(speed_abs),
+                        "cmd_v_mps": float(out_v),
+                        "cmd_w_radps": float(out_w),
+                        "desired_v_mps": float(desired_v),
+                        "desired_w_radps": float(desired_w),
+                        # 对齐 UI 字段：圆周用 lateral_error_m 表示半径误差
+                        "lateral_error_m": float(radius_error),
+                        "heading_error_rad": float(heading_error),
+                        "yaw_rate_error_radps": 0.0,
+                        "feedback_v_mps": float(fb_v),
+                        "feedback_w_radps": float(fb_w),
+                        "pose_age_s": 0.0,
+                        "dist_to_goal_m": float(max(0.0, total_angle_rad - accum_angle) * radius_m),
+                        "path_s_m": float(accum_angle * radius_m),
+                        "path_curvature_inv_m": float(abs(out_w) / max(abs(out_v), 0.1)),
+                        "path_ff_w_radps": float(w_ff),
+                        "profile_speed_mps": float(speed_abs),
+                        "motion_distance_total_m": float(traveled),
+                        "motion_distance_total_signed_m": float(traveled),
+                    }
+                    if isinstance(record_context, dict) and record_context:
+                        payload.update({str(k): v for k, v in record_context.items()})
+                    sample_callback(payload)
+                except Exception:
+                    pass
+
+            sample_count += 1
+            peak_abs_radius_error = max(peak_abs_radius_error, abs(float(radius_error)))
+            peak_abs_heading_error_deg = max(
+                peak_abs_heading_error_deg, abs(math.degrees(float(heading_error)))
+            )
+            peak_abs_cmd_w = max(peak_abs_cmd_w, abs(float(out_w)))
+
+            time.sleep(dt_eff)
+
+        self._send_motion_command(0.0, 0.0)
+        if self._stop_flag.is_set() and exit_reason == "loop_exit":
+            exit_reason = "stop_flag"
+        duration_s = max(0.0, time.time() - started_wall_ts)
+        if callable(metrics_callback):
+            try:
+                record: Dict[str, Any] = {
+                    "timestamp": float(started_wall_ts),
+                    "run_key": str(run_key),
+                    "run_label": str(run_label or ""),
+                    "tracking_mode": "circle_orbit",
+                    "speed_mps": float(speed_abs),
+                    "speed_sign": 1.0,
+                    "nominal_speed_abs_mps": float(speed_abs),
+                    "duration_s": float(duration_s),
+                    "samples": int(sample_count),
+                    "peak_abs_lateral_error_m": float(peak_abs_radius_error),
+                    "peak_abs_heading_error_deg": float(peak_abs_heading_error_deg),
+                    "peak_abs_cmd_w_radps": float(peak_abs_cmd_w),
+                    "completed": bool(completed),
+                    "exit_reason": str(exit_reason),
+                    "motion_distance_total_m": float(traveled),
+                    "motion_distance_total_signed_m": float(traveled),
+                }
+                if isinstance(record_context, dict) and record_context:
+                    record.update({str(k): v for k, v in record_context.items()})
+                metrics_callback(record)
+            except Exception:
+                pass
+
     def follow_path(
         self,
         waypoints: List[Tuple[float, float]],
@@ -492,6 +903,40 @@ class ScoutMiniCAN:
 
     # ================ PID 路径跟踪 ================
 
+    def get_directional_straight_tracking_kwargs(self, speed_sign: float) -> Dict[str, Any]:
+        """
+        与 UI 兼容：返回直线段前进/倒车的专用参数字典。
+
+        注意：当前 `follow_path_with_pid` 是 PID 直线/圆弧跟踪实现，部分 Stanley/PID 扩展参数会被忽略。
+        """
+        if float(speed_sign) < 0.0:
+            # 倒车段：保守一点的角速度变化、稍大前瞻
+            return {
+                "lookahead_distance": 0.52,
+                "tracking_mode": "stanley",
+                "stanley_gain": 0.1,
+                "stanley_softening_speed_mps": 0.55,
+                "stanley_lateral_pd_kp": 0.04,
+                "stanley_lateral_pd_kd": 0.0,
+                "stanley_lateral_pd_output_limit_radps": 1.15,
+                "max_w_rate": 3.0,
+                "max_w_step": 0.020,
+            }
+        kwargs = dict(FORWARD_STRAIGHT_TRACKING_KWARGS)
+        kwargs.update(
+            {
+                "tracking_mode": "stanley",
+                "stanley_gain": float(kwargs.get("stanley_gain", 0.1)),
+                "stanley_softening_speed_mps": float(
+                    kwargs.get("stanley_softening_speed_mps", 0.55)
+                ),
+                "stanley_lateral_pd_kp": 0.04,
+                "stanley_lateral_pd_kd": 0.0,
+                "stanley_lateral_pd_output_limit_radps": 1.15,
+            }
+        )
+        return kwargs
+
     def follow_path_with_pid(
         self,
         waypoints: List[Tuple[float, float]],
@@ -507,6 +952,19 @@ class ScoutMiniCAN:
         w_bias_hf_gain: float = 0.35,
         max_v_rate: float = 1.5,
         max_w_rate: float = 4.0,
+        max_w_step: Optional[float] = None,
+        speed_profile: Optional[List[Tuple[float, float]]] = None,
+        metrics_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        sample_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        run_label: Optional[str] = None,
+        record_context: Optional[Dict[str, Any]] = None,
+        tracking_mode: str = "stanley",
+        stanley_gain: float = 0.1,
+        stanley_softening_speed_mps: float = 0.55,
+        stanley_lateral_pd_kp: float = 0.0,
+        stanley_lateral_pd_kd: float = 0.0,
+        stanley_lateral_pd_output_limit_radps: float = 1.15,
+        **_extra: Any,
     ) -> None:
         """
         使用PID控制的路径跟踪方法
@@ -527,6 +985,8 @@ class ScoutMiniCAN:
             max_w_rate: 角速度变化率上限(rad/s^2)
         """
         self._stop_flag.clear()
+        started_wall_ts = time.time()
+        run_key = f"{started_wall_ts:.6f}|{str(run_label or '轨迹').strip() or '轨迹'}"
         speed_sign = 1.0 if speed_mps >= 0 else -1.0
         speed_abs = abs(speed_mps)
         if speed_abs <= 0.0 or len(waypoints) < 2:
@@ -543,6 +1003,29 @@ class ScoutMiniCAN:
             s_cum.append(total_len)
 
         avg_step = total_len / max(1, len(waypoints) - 1)
+        # ===== 停车预判（提前减速段 & 到点阈值下限）=====
+        # 目标：速度越高，越早开始减速；到点阈值也略抬高，减少“冲过终点再回拉”的情况。
+        # 基于简化停车距离：d ~= v^2/(2a) + k*v + margin，a 取经验值。
+        a_assume = 0.70  # m/s^2，经验减速度（越小则预判越保守/更早减速）
+        d_stop = (speed_abs * speed_abs) / (2.0 * max(0.25, a_assume))
+        d_extra = 0.55 * speed_abs + 0.25
+        slow_down_auto = max(0.55, d_stop + d_extra)
+        # 不让减速段超过路径太多（短路径避免全程都在减速）
+        slow_down_auto = min(slow_down_auto, max(0.6, total_len * 0.65))
+        if slow_down_dist is None:
+            slow_down_dist = slow_down_auto
+        else:
+            try:
+                slow_down_dist = max(float(slow_down_dist), slow_down_auto)
+            except (TypeError, ValueError):
+                slow_down_dist = slow_down_auto
+
+        # 到点阈值下限：速度越高略增大，让停车更“提前”
+        try:
+            arrival_dist = max(float(arrival_dist), min(0.38, 0.16 + 0.12 * speed_abs))
+        except (TypeError, ValueError):
+            arrival_dist = min(0.38, 0.16 + 0.12 * speed_abs)
+
         loop_close_dist = max(0.1, arrival_dist * 2.0)
         is_loop = math.hypot(
             waypoints[-1][0] - waypoints[0][0],
@@ -578,12 +1061,33 @@ class ScoutMiniCAN:
         self.heading_pid.reset()
         self.lateral_pid.reset()
 
-        print(f"[ScoutMiniCAN] PID路径跟踪开始: {len(waypoints)}个点, 速度={speed_mps}m/s")
+        mode = str(tracking_mode or "").strip().lower()
+        # 移除纯 PID：无论外部传 pid/其他值，都强制走 Stanley 逻辑
+        if mode not in {"stanley", "stanley_pid"}:
+            mode = "stanley"
+        tracking_mode = mode
+        use_stanley = True
+
+        print(
+            f"[ScoutMiniCAN] 路径跟踪开始: {len(waypoints)}个点, 速度={speed_mps}m/s, "
+            f"mode={tracking_mode}"
+        )
+
+        sample_count = 0
+        yaw_fb_samples = 0
+        peak_abs_lateral_error = 0.0
+        peak_abs_heading_error = 0.0
+        peak_abs_cmd_w = 0.0
+        peak_abs_yaw_rate_err = 0.0
+        peak_abs_fb_w = 0.0
+        exit_reason = "loop_exit"
+        completed = False
 
         while not self._stop_flag.is_set():
             pose = update_pose()
             if pose is None:
                 print("[ScoutMiniCAN] PID路径跟踪: 位姿丢失, 主动停车.")
+                exit_reason = "pose_lost"
                 break
 
             current_x, current_y, current_yaw = pose.x, pose.y, pose.yaw
@@ -596,6 +1100,8 @@ class ScoutMiniCAN:
             dy_goal = waypoints[-1][1] - current_y
             dist_to_goal = math.hypot(dx_goal, dy_goal)
             if (not is_loop) and dist_to_goal <= arrival_dist:
+                exit_reason = "goal_arrived"
+                completed = True
                 break
 
             # 寻找最近路径点和前瞻点
@@ -634,18 +1140,64 @@ class ScoutMiniCAN:
                 target_heading = math.atan2(dy_heading, dx_heading)
             heading_error = _wrap_angle(target_heading - motion_yaw)
 
-            # PID控制
-            lateral_correction = self.lateral_pid.update(lateral_error, dt)
-            heading_correction = self.heading_pid.update(heading_error, dt)
-
-            # 合成角速度命令
-            angular_speed = lateral_correction + heading_correction
+            stanley_term = 0.0
+            stanley_lateral_pd_out = 0.0
+            if use_stanley:
+                speed_term = max(
+                    0.05,
+                    abs(float(speed_abs)) + abs(float(stanley_softening_speed_mps)),
+                )
+                stanley_term = math.atan2(float(stanley_gain) * float(lateral_error), speed_term)
+                stanley_output = _wrap_angle(float(heading_error) + float(stanley_term))
+                if abs(float(stanley_lateral_pd_kp)) > 1e-9 or abs(float(stanley_lateral_pd_kd)) > 1e-9:
+                    try:
+                        dt_eff_pd = float(dt) if dt and float(dt) > 0 else 0.02
+                    except Exception:
+                        dt_eff_pd = 0.02
+                    if not hasattr(self, "_stanley_lat_pd_prev_err"):
+                        self._stanley_lat_pd_prev_err = float(lateral_error)
+                    prev_err = float(getattr(self, "_stanley_lat_pd_prev_err"))
+                    derr = (float(lateral_error) - prev_err) / max(1e-6, dt_eff_pd)
+                    self._stanley_lat_pd_prev_err = float(lateral_error)
+                    stanley_lateral_pd_out = float(stanley_lateral_pd_kp) * float(lateral_error) + float(
+                        stanley_lateral_pd_kd
+                    ) * float(derr)
+                    lim = max(0.05, abs(float(stanley_lateral_pd_output_limit_radps)))
+                    stanley_lateral_pd_out = _sat(stanley_lateral_pd_out, -lim, lim)
+                angular_speed = float(stanley_output) + float(stanley_lateral_pd_out)
+                lateral_correction = float(stanley_output)
+                heading_correction = 0.0
+            else:
+                # 理论上不会走到这里：纯 PID 已移除
+                angular_speed = 0.0
+                lateral_correction = 0.0
+                heading_correction = 0.0
             angular_speed = _sat(angular_speed, -self.MAX_ANGULAR_RADPS, self.MAX_ANGULAR_RADPS)
 
             # 自适应速度控制：根据曲率和误差调整速度
             curvature = abs(angular_speed) / max(speed_abs, 0.1)
             speed_factor = 1.0 / (1.0 + 2.0 * curvature + 3.0 * abs(lateral_error))
             speed_scale = max(0.3, speed_factor)
+            # 速度剖面：若提供 (s[m], speed_abs[m/s]) 列表，则在路径弧长上做线性插值替换标称速度
+            if speed_profile:
+                s_now = float(s_cum[min(nearest_idx, len(s_cum) - 1)])
+                sp = sorted(
+                    ((float(s), abs(float(v))) for s, v in speed_profile),
+                    key=lambda x: x[0],
+                )
+                if sp:
+                    if s_now <= sp[0][0]:
+                        speed_abs_profile = sp[0][1]
+                    elif s_now >= sp[-1][0]:
+                        speed_abs_profile = sp[-1][1]
+                    else:
+                        speed_abs_profile = speed_abs
+                        for (s0, v0), (s1, v1) in zip(sp, sp[1:]):
+                            if s0 <= s_now <= s1 and s1 > s0 + 1e-9:
+                                t = (s_now - s0) / (s1 - s0)
+                                speed_abs_profile = (1.0 - t) * v0 + t * v1
+                                break
+                    speed_abs = max(0.0, float(speed_abs_profile))
             if slow_down_dist is not None and slow_down_dist > 0.0:
                 if dist_to_goal < slow_down_dist:
                     speed_scale *= max(0.15, dist_to_goal / slow_down_dist)
@@ -674,6 +1226,11 @@ class ScoutMiniCAN:
             else:
                 dv_max = max_v_rate * dt_eff
                 dw_max = max_w_rate * dt_eff
+                if max_w_step is not None:
+                    try:
+                        dw_max = min(dw_max, abs(float(max_w_step)))
+                    except (TypeError, ValueError):
+                        pass
                 dv = desired_v - prev_cmd_v
                 dw = desired_w - prev_cmd_w
                 if abs(dv) > dv_max:
@@ -691,23 +1248,110 @@ class ScoutMiniCAN:
             prev_cmd_w = cmd_w
 
             self._send_motion_command(cmd_v, cmd_w)
+            if callable(sample_callback):
+                try:
+                    now_ts = time.time()
+                    fb_v = 0.0
+                    fb_w = 0.0
+                    try:
+                        st = self.get_status()
+                        fb_v = float(getattr(st, "linear_speed", 0.0) or 0.0)
+                        fb_w = float(getattr(st, "angular_speed", 0.0) or 0.0)
+                    except Exception:
+                        fb_v = 0.0
+                        fb_w = 0.0
+                    curvature_inv_m = abs(float(cmd_w)) / max(abs(float(cmd_v)), 0.1)
+                    payload: Dict[str, Any] = {
+                        "timestamp": float(now_ts),
+                        "relative_time_s": float(max(0.0, now_ts - started_wall_ts)),
+                        "run_key": str(run_key),
+                        "run_label": str(run_label or ""),
+                        "tracking_mode": str(tracking_mode or "pid"),
+                        "speed_sign": float(speed_sign),
+                        "speed_mps": float(speed_mps),
+                        "nominal_speed_abs_mps": float(speed_abs),
+                        "lookahead_base_m": float(lookahead_distance),
+                        "arrival_dist_m": float(arrival_dist),
+                        "slow_down_dist_m": float(slow_down_dist or 0.0),
+                        "stanley_gain": float(stanley_gain),
+                        # UI 字段名沿用历史：softening_distance_m（本实现为速度软化项，数值仍可用于对比）
+                        "stanley_softening_distance_m": float(stanley_softening_speed_mps),
+                        "stanley_term_rad": float(stanley_term),
+                        "lateral_pid_kp": float(getattr(self.lateral_pid, "kp", 0.0) or 0.0),
+                        "lateral_pid_ki": float(getattr(self.lateral_pid, "ki", 0.0) or 0.0),
+                        "lateral_pid_kd": float(getattr(self.lateral_pid, "kd", 0.0) or 0.0),
+                        "heading_pid_kp": float(getattr(self.heading_pid, "kp", 0.0) or 0.0),
+                        "heading_pid_ki": float(getattr(self.heading_pid, "ki", 0.0) or 0.0),
+                        "heading_pid_kd": float(getattr(self.heading_pid, "kd", 0.0) or 0.0),
+                        "yaw_rate_pid_kp": 0.0,
+                        "yaw_rate_pid_ki": 0.0,
+                        "yaw_rate_pid_kd": 0.0,
+                        "cmd_v_mps": float(cmd_v),
+                        "cmd_w_radps": float(cmd_w),
+                        "desired_v_mps": float(desired_v),
+                        "desired_w_radps": float(desired_w),
+                        "lateral_error_m": float(lateral_error),
+                        "stanley_lateral_pd_output_radps": float(stanley_lateral_pd_out),
+                        "heading_error_rad": float(heading_error),
+                        "yaw_rate_error_radps": 0.0,
+                        "feedback_v_mps": float(fb_v),
+                        "feedback_w_radps": float(fb_w),
+                        "yaw_rate_feedback_valid": 0,
+                        "pose_age_s": 0.0,
+                        "dist_to_goal_m": float(dist_to_goal),
+                        "path_s_m": float(s_cum[min(nearest_idx, len(s_cum) - 1)]),
+                        "motion_distance_m": float(traveled),
+                        "motion_distance_signed_m": float(speed_sign * traveled),
+                        "motion_distance_total_m": float(traveled),
+                        "motion_distance_total_signed_m": float(speed_sign * traveled),
+                        "lateral_pid_output_radps": float(lateral_correction),
+                        "heading_pid_output_radps": float(heading_correction),
+                        "yaw_rate_pid_output_radps": 0.0,
+                        "path_curvature_inv_m": float(curvature_inv_m),
+                        "path_ff_w_radps": 0.0,
+                        "profile_speed_mps": float(speed_abs),
+                    }
+                    if isinstance(record_context, dict) and record_context:
+                        payload.update({str(k): v for k, v in record_context.items()})
+                    sample_callback(payload)
+                except Exception:
+                    pass
+
+            sample_count += 1
+            peak_abs_lateral_error = max(peak_abs_lateral_error, abs(float(lateral_error)))
+            peak_abs_heading_error = max(peak_abs_heading_error, abs(math.degrees(float(heading_error))))
+            peak_abs_cmd_w = max(peak_abs_cmd_w, abs(float(cmd_w)))
+            peak_abs_yaw_rate_err = max(peak_abs_yaw_rate_err, abs(0.0))
+            try:
+                fb_w = float(getattr(self.get_status(), "angular_speed", 0.0) or 0.0)
+            except Exception:
+                fb_w = 0.0
+            peak_abs_fb_w = max(peak_abs_fb_w, abs(fb_w))
 
             # 检查是否到达终点
             remaining_len = max(0.0, total_len - s_cum[min(nearest_idx, len(s_cum) - 1)])
             if remaining_len <= arrival_dist:
                 if dist_to_goal <= arrival_dist:
                     if (not is_loop) or (traveled >= loop_finish_min):
+                        exit_reason = "goal_arrived"
+                        completed = True
                         break
                 if (not is_loop) and abs(lateral_error) <= near_goal_deadband:
+                    exit_reason = "goal_arrived"
+                    completed = True
                     break
             if traveled >= total_len and dist_to_goal <= arrival_dist:
                 if (not is_loop) or (traveled >= loop_finish_min):
+                    exit_reason = "goal_arrived"
+                    completed = True
                     break
             if not is_loop:
                 if dist_to_goal <= near_goal_deadband:
                     if near_goal_since is None:
                         near_goal_since = time.time()
                     elif time.time() - near_goal_since >= near_goal_hold_s:
+                        exit_reason = "goal_arrived"
+                        completed = True
                         break
                 else:
                     near_goal_since = None
@@ -715,6 +1359,41 @@ class ScoutMiniCAN:
             time.sleep(dt)
 
         self._send_motion_command(0.0, 0.0)
+        if self._stop_flag.is_set() and exit_reason == "loop_exit":
+            exit_reason = "stop_flag"
+        duration_s = max(0.0, time.time() - started_wall_ts)
+        if callable(metrics_callback):
+            try:
+                record: Dict[str, Any] = {
+                    "timestamp": float(started_wall_ts),
+                    "run_key": str(run_key),
+                    "run_label": str(run_label or ""),
+                    "tracking_mode": str(tracking_mode or "pid"),
+                    "speed_mps": float(speed_mps),
+                    "speed_sign": float(speed_sign),
+                    "nominal_speed_abs_mps": float(speed_abs),
+                    "lookahead_base_m": float(lookahead_distance),
+                    "arrival_dist_m": float(arrival_dist),
+                    "slow_down_dist_m": float(slow_down_dist or 0.0),
+                    "waypoints_count": int(len(waypoints)),
+                    "duration_s": float(duration_s),
+                    "samples": int(sample_count),
+                    "feedback_samples": int(yaw_fb_samples),
+                    "peak_abs_lateral_error_m": float(peak_abs_lateral_error),
+                    "peak_abs_heading_error_deg": float(peak_abs_heading_error),
+                    "peak_abs_yaw_rate_error_radps": float(peak_abs_yaw_rate_err),
+                    "peak_abs_cmd_w_radps": float(peak_abs_cmd_w),
+                    "peak_abs_feedback_w_radps": float(peak_abs_fb_w),
+                    "completed": bool(completed),
+                    "exit_reason": str(exit_reason),
+                    "motion_distance_total_m": float(traveled),
+                    "motion_distance_total_signed_m": float(speed_sign * traveled),
+                }
+                if isinstance(record_context, dict) and record_context:
+                    record.update({str(k): v for k, v in record_context.items()})
+                metrics_callback(record)
+            except Exception:
+                pass
         print("[ScoutMiniCAN] PID路径跟踪完成")
 
     def _find_lookahead_point(
@@ -953,7 +1632,7 @@ class ScoutMiniCAN:
             print(
                 f"[ScoutMiniCAN] RX 0x{self.ID_MOTION_FB:03X} "
                 f"v={v:.3f}m/s w={w:.3f}rad/s bytes={pretty}"
-            )
+                 )
 
     def _parse_sys_status(self, data: bytes) -> None:
         """
@@ -964,6 +1643,7 @@ class ScoutMiniCAN:
         """
         if len(data) < 4:
             return
+        
 
         sys_status = data[0]
         mode = data[1]

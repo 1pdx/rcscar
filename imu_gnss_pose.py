@@ -18,10 +18,10 @@ import socket
 import threading
 import time
 from dataclasses import dataclass, replace
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, Sequence
 
 
-# WGS84 椭球参数（用于将经纬度差换算成米）
+# WGS84 椭球参数（用于小范围局部平面近似）
 WGS84_A_M = 6378137.0               # 半长轴 (m)
 WGS84_E2 = 6.69437999014e-3         # 第一偏心率平方
 
@@ -41,7 +41,7 @@ def _deg2rad(deg: float) -> float:
     return deg * math.pi / 180.0
 
 
-def _geodetic_to_enu(
+def _geodetic_to_enu_raw(
     lat_deg: float,
     lon_deg: float,
     h_m: float,
@@ -54,6 +54,10 @@ def _geodetic_to_enu(
       x: 东向 (m)
       y: 北向 (m)
       z: Up   (m)
+
+    小范围二维应用下，统一将所有点投影到参考点的局部水平面：
+      - x/y 仅由经纬度差决定，且使用参考点高度作为固定尺度；
+      - z 固定为 0，不再保留逐点高程差。
     """
     lat = _deg2rad(lat_deg)
     lon = _deg2rad(lon_deg)
@@ -70,10 +74,42 @@ def _geodetic_to_enu(
     rn = WGS84_A_M / math.sqrt(denom)             # 卯酉曲率半径
     rm = rn * (1.0 - WGS84_E2) / denom            # 子午曲率半径
 
-    x = dlon * cos_ref * (rn + h_m)
-    y = dlat * (rm + h_m)
-    z = h_m - ref_h_m
+    plane_h_m = ref_h_m
+    x = dlon * cos_ref * (rn + plane_h_m)
+    y = dlat * (rm + plane_h_m)
+    z = 0.0
     return x, y, z
+
+
+def _apply_enu_calibration_xy(x_m: float, y_m: float) -> Tuple[float, float]:
+    if not _enu_calib_enabled:
+        return x_m, y_m
+
+    cos_rot = math.cos(_enu_calib_rot_rad)
+    sin_rot = math.sin(_enu_calib_rot_rad)
+    x_rot = x_m * cos_rot - y_m * sin_rot
+    y_rot = x_m * sin_rot + y_m * cos_rot
+    return x_rot + _enu_calib_tx, y_rot + _enu_calib_ty
+
+
+def _geodetic_to_enu(
+    lat_deg: float,
+    lon_deg: float,
+    h_m: float,
+    ref_lat_deg: float,
+    ref_lon_deg: float,
+    ref_h_m: float,
+) -> Tuple[float, float, float]:
+    x_m, y_m, z_m = _geodetic_to_enu_raw(
+        lat_deg,
+        lon_deg,
+        h_m,
+        ref_lat_deg,
+        ref_lon_deg,
+        ref_h_m,
+    )
+    x_m, y_m = _apply_enu_calibration_xy(x_m, y_m)
+    return x_m, y_m, z_m
 
 
 # ======================== 统一位姿/状态结构体 ========================
@@ -87,6 +123,9 @@ class PoseSolution:
       "INS"   - INSPVAXA 融合解
     yaw:
       以东向为 0，逆时针为正（rad），与 main_ui 轨迹坐标系一致。
+      与 car_control 一致：校准平面内 +Y 为前进方向、+X 为右侧时，横向误差“路径右侧为正”，w>0 为 CCW 左转。
+
+    当前实现面向小范围二维平面应用，z 固定为 0。
     """
     source: str
     gps_week: Optional[int]
@@ -124,6 +163,16 @@ class ImuStatusSummary:
 
 # ======================== 核心客户端 ========================
 
+@dataclass
+class EnuCalibrationSummary:
+    enabled: bool
+    point_count: int
+    rotation_deg: float
+    translation_x_m: float
+    translation_y_m: float
+    rms_error_m: Optional[float]
+
+
 class ImuGnssClient:
     """
     监听 X1 ICOM2 的 UDP ASCII 报文，仅解析 INSPVAXA。
@@ -157,7 +206,7 @@ class ImuGnssClient:
         # 最近收包时间戳
         self._t_inspvax: Optional[float] = None
 
-        # 频率估算（固定 20 Hz）
+        # 频率估算：由相邻 INSPVAXA 的 TOW 差或收包墙钟间隔 EMA 得到（如 50Hz 输出）
         self._last_tow_inspvax: Optional[float] = None
         self._freq_inspvax: Optional[float] = None
 
@@ -235,6 +284,12 @@ class ImuGnssClient:
                 freq_inspvax=self._freq_inspvax,
             )
 
+    def get_reference(self) -> Optional[Tuple[float, float, float]]:
+        with self._lock:
+            if self._ref_lat is None or self._ref_lon is None or self._ref_h is None:
+                return None
+            return self._ref_lat, self._ref_lon, self._ref_h
+
     def stop(self) -> None:
         self._stop_flag = True
         try:
@@ -290,6 +345,8 @@ class ImuGnssClient:
         roll = _deg2rad(ins["roll_deg"])
 
         yaw = yaw_raw
+        if _enu_calib_enabled:
+            yaw = _wrap_angle_rad(yaw + _enu_calib_rot_rad)
 
         gps_week = ins.get("week")
         gps_sec = ins.get("tow")
@@ -404,7 +461,24 @@ class ImuGnssClient:
 
         now = time.time()
         with self._lock:
-            self._freq_inspvax = 20.0
+            prev_tow = self._last_tow_inspvax
+            prev_wall = self._t_inspvax
+            dt_msg: Optional[float] = None
+            if prev_tow is not None:
+                d_tow = tow - prev_tow
+                if 1e-5 < d_tow < 2.0:
+                    dt_msg = d_tow
+            if dt_msg is None and prev_wall is not None:
+                d_wall = now - prev_wall
+                if 1e-4 < d_wall < 0.5:
+                    dt_msg = d_wall
+            if dt_msg is not None and dt_msg > 1e-6:
+                inst_hz = min(200.0, max(1.0, 1.0 / dt_msg))
+                if self._freq_inspvax is None:
+                    self._freq_inspvax = inst_hz
+                else:
+                    self._freq_inspvax = 0.88 * self._freq_inspvax + 0.12 * inst_hz
+
             self._last_tow_inspvax = tow
 
             self._ins = {
@@ -448,7 +522,14 @@ _calib_enabled = False
 _calib_x = 0.0
 _calib_y = 0.0
 _calib_yaw = 0.0
+_calib_zero_yaw_enabled = True
 _yaw_offset_rad = 0.0
+_enu_calib_enabled = False
+_enu_calib_rot_rad = 0.0
+_enu_calib_tx = 0.0
+_enu_calib_ty = 0.0
+_enu_calib_point_count = 0
+_enu_calib_rms_error_m: Optional[float] = None
 
 _yaw_offset_env = os.getenv("IMU_YAW_OFFSET_DEG", "").strip()
 if _yaw_offset_env:
@@ -485,12 +566,32 @@ def get_robot_pose() -> Optional[PoseSolution]:
         return None
 
     if _calib_enabled:
+        yaw = pose.yaw
+        if _calib_zero_yaw_enabled:
+            yaw = _wrap_angle_rad(yaw - _calib_yaw)
+        if _yaw_offset_rad != 0.0:
+            yaw = _wrap_angle_rad(yaw + _yaw_offset_rad)
         return replace(
             pose,
             x=pose.x - _calib_x,
             y=pose.y - _calib_y,
-            yaw=_wrap_angle_rad(pose.yaw - _calib_yaw + _yaw_offset_rad),
+            yaw=yaw,
         )
+    if _yaw_offset_rad != 0.0:
+        return replace(pose, yaw=_wrap_angle_rad(pose.yaw + _yaw_offset_rad))
+    return pose
+
+
+def get_absolute_robot_pose() -> Optional[PoseSolution]:
+    """
+    返回未经 calibrate_pose_to_current() 平移/归零的绝对 ENU 位姿。
+    仍会应用固定的 yaw offset，用于车体安装偏角修正。
+    """
+    client = _get_client()
+    pose = client.get_pose()
+    if pose is None:
+        return None
+
     if _yaw_offset_rad != 0.0:
         return replace(pose, yaw=_wrap_angle_rad(pose.yaw + _yaw_offset_rad))
     return pose
@@ -500,7 +601,7 @@ def calibrate_pose_to_current() -> bool:
     """
     将当前位姿设置为原点 (0,0,0)，用于试验起点校准。
     """
-    global _calib_enabled, _calib_x, _calib_y, _calib_yaw
+    global _calib_enabled, _calib_x, _calib_y, _calib_yaw, _calib_zero_yaw_enabled
     client = _get_client()
     pose = client.get_pose()
     if pose is None:
@@ -510,11 +611,366 @@ def calibrate_pose_to_current() -> bool:
     _calib_y = pose.y
     _calib_yaw = pose.yaw
     _calib_enabled = True
+    _calib_zero_yaw_enabled = True
     print(
         f"[imu_gnss_pose] Calibration set at "
         f"x0={_calib_x:.3f}, y0={_calib_y:.3f}, yaw0={_calib_yaw:.3f} rad"
     )
     return True
+
+
+def set_position_origin_to_current() -> bool:
+    """
+    仅将当前位置设为坐标原点，保留当前校准后的航向定义。
+    """
+    global _calib_enabled, _calib_x, _calib_y, _calib_yaw, _calib_zero_yaw_enabled
+    client = _get_client()
+    pose = client.get_pose()
+    if pose is None:
+        return False
+
+    _calib_x = pose.x
+    _calib_y = pose.y
+    _calib_yaw = pose.yaw
+    _calib_enabled = True
+    _calib_zero_yaw_enabled = False
+    print(
+        f"[imu_gnss_pose] Position origin set at "
+        f"x0={_calib_x:.3f}, y0={_calib_y:.3f}, keep_yaw={_calib_yaw:.3f} rad"
+    )
+    return True
+
+
+def reset_navigation_position_origin() -> None:
+    """
+    清除「位置平移原点」(_calib_x/_calib_y)，停止对 get_robot_pose 做平面平移。
+    在重新经纬度定系、旋转 ENU 平面期间应先调用，避免旧原点与新旋转混用导致
+    原点错误地像「当前车位置」。
+    """
+    global _calib_enabled, _calib_x, _calib_y, _calib_zero_yaw_enabled
+    _calib_enabled = False
+    _calib_x = 0.0
+    _calib_y = 0.0
+    _calib_zero_yaw_enabled = False
+
+
+def set_position_origin_to_xy(x_m: float, y_m: float) -> bool:
+    """
+    将指定平面坐标 (x,y) 设为位置原点（与 get_absolute_robot_pose 同一套 ENU+校准平面坐标），
+    不修改航向零点（与 set_position_origin_to_current 一致）。
+    用于“以某一已知经纬度点为原点”而与当前车位无关。
+    """
+    global _calib_enabled, _calib_x, _calib_y, _calib_yaw, _calib_zero_yaw_enabled
+    client = _get_client()
+    pose = client.get_pose()
+    _calib_x = float(x_m)
+    _calib_y = float(y_m)
+    if pose is not None:
+        _calib_yaw = pose.yaw
+    else:
+        _calib_yaw = 0.0
+    _calib_enabled = True
+    _calib_zero_yaw_enabled = False
+    print(
+        f"[imu_gnss_pose] Position origin set to fixed xy "
+        f"x0={_calib_x:.3f}, y0={_calib_y:.3f}, keep_yaw={_calib_yaw:.3f} rad"
+    )
+    return True
+
+
+def absolute_planar_xy_from_geodetic(
+    lat_deg: float,
+    lon_deg: float,
+    height_m: Optional[float] = None,
+) -> Tuple[float, float, float]:
+    """
+    将经纬度映射到当前 ENU 参考 + ENU 校准后的平面 (x,y,z)（米），
+    不含 calibrate_pose / set_position_origin 的平移。
+    """
+    client = _get_client()
+    ref = client.get_reference()
+    if ref is None:
+        raise RuntimeError("ENU reference is not initialized yet")
+    ref_lat, ref_lon, ref_h = ref
+    h_m = float(height_m) if height_m is not None else float(ref_h)
+    return _geodetic_to_enu(float(lat_deg), float(lon_deg), h_m, ref_lat, ref_lon, ref_h)
+
+
+def _as_sys_xy(point: Sequence[float]) -> Tuple[float, float]:
+    if len(point) < 2:
+        raise ValueError("system ENU point requires at least x and y")
+    return float(point[0]), float(point[1])
+
+
+def _as_lla(point: Sequence[float], default_h_m: float) -> Tuple[float, float, float]:
+    if len(point) < 2:
+        raise ValueError("LLA point requires at least lat and lon")
+    lat = float(point[0])
+    lon = float(point[1])
+    if len(point) >= 3 and point[2] is not None:
+        h_m = float(point[2])
+    else:
+        h_m = float(default_h_m)
+    return lat, lon, h_m
+
+
+def _solve_rigid_transform_2d(
+    source_points: Sequence[Tuple[float, float]],
+    target_points: Sequence[Tuple[float, float]],
+) -> Tuple[float, float, float, float]:
+    count = len(source_points)
+    if count != len(target_points):
+        raise ValueError("point count mismatch")
+    if count < 2:
+        raise ValueError("at least two point pairs are required")
+
+    src_cx = sum(point[0] for point in source_points) / count
+    src_cy = sum(point[1] for point in source_points) / count
+    dst_cx = sum(point[0] for point in target_points) / count
+    dst_cy = sum(point[1] for point in target_points) / count
+
+    dot_sum = 0.0
+    cross_sum = 0.0
+    src_spread = 0.0
+    dst_spread = 0.0
+    for (src_x, src_y), (dst_x, dst_y) in zip(source_points, target_points):
+        src_x_c = src_x - src_cx
+        src_y_c = src_y - src_cy
+        dst_x_c = dst_x - dst_cx
+        dst_y_c = dst_y - dst_cy
+        dot_sum += src_x_c * dst_x_c + src_y_c * dst_y_c
+        cross_sum += src_x_c * dst_y_c - src_y_c * dst_x_c
+        src_spread += src_x_c * src_x_c + src_y_c * src_y_c
+        dst_spread += dst_x_c * dst_x_c + dst_y_c * dst_y_c
+
+    if src_spread <= 1e-9 or dst_spread <= 1e-9:
+        raise ValueError("control points are degenerate")
+
+    rot_rad = math.atan2(cross_sum, dot_sum)
+    cos_rot = math.cos(rot_rad)
+    sin_rot = math.sin(rot_rad)
+    tx_m = dst_cx - (src_cx * cos_rot - src_cy * sin_rot)
+    ty_m = dst_cy - (src_cx * sin_rot + src_cy * cos_rot)
+
+    err_sq_sum = 0.0
+    for (src_x, src_y), (dst_x, dst_y) in zip(source_points, target_points):
+        fit_x = src_x * cos_rot - src_y * sin_rot + tx_m
+        fit_y = src_x * sin_rot + src_y * cos_rot + ty_m
+        err_x = fit_x - dst_x
+        err_y = fit_y - dst_y
+        err_sq_sum += err_x * err_x + err_y * err_y
+
+    rms_error_m = math.sqrt(err_sq_sum / count)
+    return rot_rad, tx_m, ty_m, rms_error_m
+
+
+def calibrate_enu_from_points(
+    points_sys: Sequence[Sequence[float]],
+    points_lla: Sequence[Sequence[float]],
+) -> EnuCalibrationSummary:
+    global _enu_calib_enabled
+    global _enu_calib_rot_rad
+    global _enu_calib_tx
+    global _enu_calib_ty
+    global _enu_calib_point_count
+    global _enu_calib_rms_error_m
+
+    if len(points_sys) != len(points_lla):
+        raise ValueError("points_sys and points_lla must contain the same number of points")
+    if len(points_sys) < 2:
+        raise ValueError("at least two control points are required")
+
+    client = _get_client()
+    ref = client.get_reference()
+    if ref is None:
+        raise RuntimeError("ENU reference is not initialized yet")
+    ref_lat, ref_lon, ref_h = ref
+
+    system_points_xy = []
+    raw_points_xy = []
+    for point_sys, point_lla in zip(points_sys, points_lla):
+        sys_x, sys_y = _as_sys_xy(point_sys)
+        lat, lon, h_m = _as_lla(point_lla, ref_h)
+        raw_x, raw_y, _ = _geodetic_to_enu_raw(lat, lon, h_m, ref_lat, ref_lon, ref_h)
+        system_points_xy.append((sys_x, sys_y))
+        raw_points_xy.append((raw_x, raw_y))
+
+    rot_rad, tx_m, ty_m, rms_error_m = _solve_rigid_transform_2d(
+        raw_points_xy,
+        system_points_xy,
+    )
+
+    _enu_calib_enabled = True
+    _enu_calib_rot_rad = rot_rad
+    _enu_calib_tx = tx_m
+    _enu_calib_ty = ty_m
+    _enu_calib_point_count = len(points_sys)
+    _enu_calib_rms_error_m = rms_error_m
+
+    summary = EnuCalibrationSummary(
+        enabled=True,
+        point_count=_enu_calib_point_count,
+        rotation_deg=math.degrees(_enu_calib_rot_rad),
+        translation_x_m=_enu_calib_tx,
+        translation_y_m=_enu_calib_ty,
+        rms_error_m=_enu_calib_rms_error_m,
+    )
+    print(
+        "[imu_gnss_pose] ENU calibration updated: "
+        f"points={summary.point_count}, "
+        f"rot={summary.rotation_deg:.6f} deg, "
+        f"tx={summary.translation_x_m:.3f} m, "
+        f"ty={summary.translation_y_m:.3f} m, "
+        f"rms={(summary.rms_error_m or 0.0):.3f} m"
+    )
+    return summary
+
+
+def align_enu_y_axis_with_points(points_sys: Sequence[Sequence[float]]) -> EnuCalibrationSummary:
+    global _enu_calib_enabled
+    global _enu_calib_rot_rad
+    global _enu_calib_tx
+    global _enu_calib_ty
+    global _enu_calib_point_count
+    global _enu_calib_rms_error_m
+
+    if len(points_sys) != 2:
+        raise ValueError("exactly two control points are required")
+
+    point_a_x, point_a_y = _as_sys_xy(points_sys[0])
+    point_b_x, point_b_y = _as_sys_xy(points_sys[1])
+    dx = point_b_x - point_a_x
+    dy = point_b_y - point_a_y
+    baseline_m = math.hypot(dx, dy)
+    if baseline_m < 1e-6:
+        raise ValueError("control points are too close to define a Y-axis direction")
+
+    line_yaw_rad = math.atan2(dy, dx)
+    delta_rot_rad = _wrap_angle_rad((math.pi * 0.5) - line_yaw_rad)
+
+    cos_delta = math.cos(delta_rot_rad)
+    sin_delta = math.sin(delta_rot_rad)
+    old_tx = _enu_calib_tx
+    old_ty = _enu_calib_ty
+
+    _enu_calib_enabled = True
+    _enu_calib_rot_rad = _wrap_angle_rad(_enu_calib_rot_rad + delta_rot_rad)
+    _enu_calib_tx = old_tx * cos_delta - old_ty * sin_delta
+    _enu_calib_ty = old_tx * sin_delta + old_ty * cos_delta
+    _enu_calib_point_count = 2
+    _enu_calib_rms_error_m = 0.0
+
+    summary = EnuCalibrationSummary(
+        enabled=True,
+        point_count=_enu_calib_point_count,
+        rotation_deg=math.degrees(_enu_calib_rot_rad),
+        translation_x_m=_enu_calib_tx,
+        translation_y_m=_enu_calib_ty,
+        rms_error_m=_enu_calib_rms_error_m,
+    )
+    print(
+        "[imu_gnss_pose] ENU Y-axis alignment updated: "
+        f"baseline={baseline_m:.3f} m, "
+        f"line_yaw={math.degrees(line_yaw_rad):.6f} deg, "
+        f"delta_rot={math.degrees(delta_rot_rad):.6f} deg, "
+        f"total_rot={summary.rotation_deg:.6f} deg"
+    )
+    return summary
+
+
+def define_local_frame_from_two_geodetic_points(
+    origin_lat_deg: float,
+    origin_lon_deg: float,
+    axis_lat_deg: float,
+    axis_lon_deg: float,
+    origin_height_m: Optional[float] = None,
+    axis_height_m: Optional[float] = None,
+) -> EnuCalibrationSummary:
+    """
+    用两个经纬度点建立当前跟踪用平面坐标系（小范围平面近似）：
+
+    - 清除既有 ENU 旋转平移校准后重算；
+    - 原点对应 origin 点（在位置平移后，该点在 get_robot_pose 下为 (0,0)）；
+    - 从 origin 指向 axis 的水平方向对齐为 +Y 轴（与 align_enu_y_axis_with_points 一致）；
+    - INS 航向会随平面旋转叠加同一旋转角，与路径坐标一致。
+
+    高度未给定时采用 ENU 参考高程，仅影响尺度修正项，二维路径仍落在水平面。
+    """
+    clear_enu_calibration()
+
+    client = _get_client()
+    ref = client.get_reference()
+    if ref is None:
+        raise RuntimeError("ENU reference is not initialized yet; wait for GNSS fix")
+    ref_lat, ref_lon, ref_h = ref
+
+    h0 = float(origin_height_m) if origin_height_m is not None else float(ref_h)
+    h1 = float(axis_height_m) if axis_height_m is not None else float(ref_h)
+
+    ox, oy, _ = _geodetic_to_enu_raw(
+        float(origin_lat_deg),
+        float(origin_lon_deg),
+        h0,
+        ref_lat,
+        ref_lon,
+        ref_h,
+    )
+    ax, ay, _ = _geodetic_to_enu_raw(
+        float(axis_lat_deg),
+        float(axis_lon_deg),
+        h1,
+        ref_lat,
+        ref_lon,
+        ref_h,
+    )
+
+    summary = align_enu_y_axis_with_points([(ox, oy), (ax, ay)])
+
+    ox_c, oy_c, _ = _geodetic_to_enu(
+        float(origin_lat_deg),
+        float(origin_lon_deg),
+        h0,
+        ref_lat,
+        ref_lon,
+        ref_h,
+    )
+    set_position_origin_to_xy(ox_c, oy_c)
+    print(
+        "[imu_gnss_pose] Geodetic frame: origin LLA="
+        f"({float(origin_lat_deg):.8f},{float(origin_lon_deg):.8f}) -> "
+        f"plane (x0,y0)=({ox_c:.3f},{oy_c:.3f}) m after Y-align; "
+        "get_robot_pose now relative to this landmark, not the vehicle snap from before."
+    )
+    return summary
+
+
+def clear_enu_calibration() -> None:
+    global _enu_calib_enabled
+    global _enu_calib_rot_rad
+    global _enu_calib_tx
+    global _enu_calib_ty
+    global _enu_calib_point_count
+    global _enu_calib_rms_error_m
+
+    _enu_calib_enabled = False
+    _enu_calib_rot_rad = 0.0
+    _enu_calib_tx = 0.0
+    _enu_calib_ty = 0.0
+    _enu_calib_point_count = 0
+    _enu_calib_rms_error_m = None
+    print("[imu_gnss_pose] ENU calibration cleared.")
+    reset_navigation_position_origin()
+
+
+def get_enu_calibration_summary() -> EnuCalibrationSummary:
+    return EnuCalibrationSummary(
+        enabled=_enu_calib_enabled,
+        point_count=_enu_calib_point_count,
+        rotation_deg=math.degrees(_enu_calib_rot_rad),
+        translation_x_m=_enu_calib_tx,
+        translation_y_m=_enu_calib_ty,
+        rms_error_m=_enu_calib_rms_error_m,
+    )
 
 
 def set_yaw_offset_deg(offset_deg: float) -> None:
