@@ -13,12 +13,17 @@ from imu_gnss_pose import get_robot_pose, PoseSolution
 # UI 侧会导入该常量用于复用直线前进段的跟踪参数。
 # 若需要调整直线前进段参数，请优先改这里并同步相关调用处。
 #
+# Stanley 横向 PD（在 follow_path_with_pid 中与 stanley_term 叠加）：当前默认不启用（运行时 kp/kd=0）。
+# 以下为历史默认，暂存备恢复：把 FORWARD 里对应项改回这些值即可。
+STANLEY_LATERAL_PD_KP_STORED: float = 0.04
+STANLEY_LATERAL_PD_KD_STORED: float = 0.0
+
 FORWARD_STRAIGHT_TRACKING_KWARGS: Dict[str, Any] = {
-    "lookahead_distance": 0.44,
-    "stanley_gain": 0.1,
+    "lookahead_distance": 2.0,
+    "stanley_gain": 0.4,
     "stanley_softening_speed_mps": 0.55,
     "straight_switch_pause_s": 0.12,
-    "stanley_lateral_pd_kp": 0.04,
+    "stanley_lateral_pd_kp": 0.0,
     "stanley_lateral_pd_kd": 0.0,
     "speed_pid_kp": 0.95,
     "speed_pid_ki": 0.20,
@@ -822,6 +827,8 @@ class ScoutMiniCAN:
                         "feedback_v_mps": float(fb_v),
                         "feedback_w_radps": float(fb_w),
                         "pose_age_s": 0.0,
+                        "current_x_m": float(x),
+                        "current_y_m": float(y),
                         "dist_to_goal_m": float(max(0.0, total_angle_rad - accum_angle) * radius_m),
                         "path_s_m": float(accum_angle * radius_m),
                         "path_curvature_inv_m": float(abs(out_w) / max(abs(out_v), 0.1)),
@@ -912,11 +919,11 @@ class ScoutMiniCAN:
         if float(speed_sign) < 0.0:
             # 倒车段：保守一点的角速度变化、稍大前瞻
             return {
-                "lookahead_distance": 0.52,
+                "lookahead_distance": 2.0,
                 "tracking_mode": "stanley",
-                "stanley_gain": 0.1,
+                "stanley_gain": 0.4,
                 "stanley_softening_speed_mps": 0.55,
-                "stanley_lateral_pd_kp": 0.04,
+                "stanley_lateral_pd_kp": 0.0,
                 "stanley_lateral_pd_kd": 0.0,
                 "stanley_lateral_pd_output_limit_radps": 1.15,
                 "max_w_rate": 3.0,
@@ -926,11 +933,11 @@ class ScoutMiniCAN:
         kwargs.update(
             {
                 "tracking_mode": "stanley",
-                "stanley_gain": float(kwargs.get("stanley_gain", 0.1)),
+                "stanley_gain": float(kwargs.get("stanley_gain", 0.4)),
                 "stanley_softening_speed_mps": float(
                     kwargs.get("stanley_softening_speed_mps", 0.55)
                 ),
-                "stanley_lateral_pd_kp": 0.04,
+                "stanley_lateral_pd_kp": 0.0,
                 "stanley_lateral_pd_kd": 0.0,
                 "stanley_lateral_pd_output_limit_radps": 1.15,
             }
@@ -943,7 +950,7 @@ class ScoutMiniCAN:
         speed_mps: float = 0.5,
         dt: float = 0.02,
         update_pose: Callable[[], Optional[PoseSolution]] = get_robot_pose,
-        lookahead_distance: float = 0.6,
+        lookahead_distance: float = 2.0,
         slow_down_dist: Optional[float] = None,
         arrival_dist: float = 0.05,
         smoothing_strength: float = 0.6,
@@ -959,7 +966,7 @@ class ScoutMiniCAN:
         run_label: Optional[str] = None,
         record_context: Optional[Dict[str, Any]] = None,
         tracking_mode: str = "stanley",
-        stanley_gain: float = 0.1,
+        stanley_gain: float = 0.4,
         stanley_softening_speed_mps: float = 0.55,
         stanley_lateral_pd_kp: float = 0.0,
         stanley_lateral_pd_kd: float = 0.0,
@@ -983,6 +990,23 @@ class ScoutMiniCAN:
             w_bias_hf_gain: 角速度高频保留比例(0~1)
             max_v_rate: 线速度变化率上限(m/s^2)
             max_w_rate: 角速度变化率上限(rad/s^2)
+
+        Stanley 模式（与速度符号区分前进/倒退，atan2 形式相同）：
+          令 ψ 为车体航向 yaw，k=stanley_gain，v_s=stanley_softening_speed_mps，
+          V = max(0.05, |v_nom| + v_s)，v_nom 为当前标称速度幅值。
+
+          前进 (speed_mps≥0): 运动航向 ψ_m = ψ
+          倒退 (speed_mps<0): 运动航向 ψ_m = wrap(ψ + π)（与车尾运动方向一致）
+
+          最近路径点 (x_n,y_n)，横向误差 e_y 为 (x_n,y_n) 在「以 ψ_m 为前向」的车体坐标系中的侧向分量
+          （与 imu_gnss_pose 约定一致：路径在右侧为正）。
+
+          路径切向 ψ_p = atan2(Δy, Δx)（由最近点→前瞻点段），
+          e_ψ = wrap(ψ_p - ψ_m)。
+
+          δ_stanley = atan2(k * e_y, V)
+          δ = wrap(e_ψ + δ_stanley)  （若启用横向 PD 则再叠加 PD 项）
+          期望角速度 ω = δ（随后经限幅/滤波；横向 PD 当前默认关闭则 kp=kd=0）。
         """
         self._stop_flag.clear()
         started_wall_ts = time.time()
@@ -1298,6 +1322,12 @@ class ScoutMiniCAN:
                         "feedback_w_radps": float(fb_w),
                         "yaw_rate_feedback_valid": 0,
                         "pose_age_s": 0.0,
+                        "current_x_m": float(current_x),
+                        "current_y_m": float(current_y),
+                        "nearest_x_m": float(nearest_x),
+                        "nearest_y_m": float(nearest_y),
+                        "lookahead_x_m": float(waypoints[lookahead_idx][0]),
+                        "lookahead_y_m": float(waypoints[lookahead_idx][1]),
                         "dist_to_goal_m": float(dist_to_goal),
                         "path_s_m": float(s_cum[min(nearest_idx, len(s_cum) - 1)]),
                         "motion_distance_m": float(traveled),
@@ -1632,7 +1662,7 @@ class ScoutMiniCAN:
             print(
                 f"[ScoutMiniCAN] RX 0x{self.ID_MOTION_FB:03X} "
                 f"v={v:.3f}m/s w={w:.3f}rad/s bytes={pretty}"
-                 )
+            )
 
     def _parse_sys_status(self, data: bytes) -> None:
         """
@@ -1643,7 +1673,6 @@ class ScoutMiniCAN:
         """
         if len(data) < 4:
             return
-        
 
         sys_status = data[0]
         mode = data[1]

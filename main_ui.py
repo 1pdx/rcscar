@@ -112,6 +112,12 @@ _TRACKING_MOTION_TRACE_FIELDS: Tuple[str, ...] = (
     "path_s_m",
     "dist_to_goal_m",
     "pose_age_s",
+    "current_x_m",
+    "current_y_m",
+    "nearest_x_m",
+    "nearest_y_m",
+    "lookahead_x_m",
+    "lookahead_y_m",
     "segment_kind",
     "segment_trajectory_name",
     "motion_direction",
@@ -3600,6 +3606,12 @@ class MainWindow(QtWidgets.QMainWindow):
             "path_s_m": self._csv_float_text(sample.get("path_s_m")),
             "dist_to_goal_m": self._csv_float_text(sample.get("dist_to_goal_m")),
             "pose_age_s": self._csv_float_text(sample.get("pose_age_s")),
+            "current_x_m": self._csv_float_text(sample.get("current_x_m")),
+            "current_y_m": self._csv_float_text(sample.get("current_y_m")),
+            "nearest_x_m": self._csv_float_text(sample.get("nearest_x_m")),
+            "nearest_y_m": self._csv_float_text(sample.get("nearest_y_m")),
+            "lookahead_x_m": self._csv_float_text(sample.get("lookahead_x_m")),
+            "lookahead_y_m": self._csv_float_text(sample.get("lookahead_y_m")),
             "segment_kind": str(sample.get("segment_kind") or ""),
             "segment_trajectory_name": str(sample.get("segment_trajectory_name") or ""),
             "motion_direction": motion_direction,
@@ -8715,18 +8727,16 @@ class MainWindow(QtWidgets.QMainWindow):
             "yaw_rate_pid_kd": 0.0,
         }
         if tracking_mode == "stanley":
-            # 纯 Stanley：略降增益+软化；直线段可叠横向 D（kp=0）抑制横偏周期性超调
+            # 纯 Stanley：略降增益+软化。Stanley 横向 PD 暂不启用（kp/kd=0）；原值暂存在 _tracking_tuning["stanley_lateral_kp/kd"]。
             kwargs.update(
                 {
-                    "stanley_gain": 0.10,
+                    "stanley_gain": 0.40,
                     "stanley_softening_speed_mps": 0.60,
                     "lookahead_heading_weight": 0.05,
                     "lookahead_heading_max_bias_deg": 52.0,
                     "max_w_step": 0.031,
                     "stanley_lateral_pd_kp": 0.0,
-                    "stanley_lateral_pd_kd": float(
-                        self._tracking_tuning["stanley_lateral_kd"]
-                    ),
+                    "stanley_lateral_pd_kd": 0.0,
                     "w_bias_tau": 0.92,
                     "w_bias_hf_gain": 0.24,
                 }
