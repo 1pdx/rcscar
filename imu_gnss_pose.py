@@ -987,6 +987,86 @@ def get_status_summary() -> ImuStatusSummary:
     return client.get_status_summary()
 
 
+def get_ins_odometry_for_cluster_csv() -> Optional[Dict[str, float]]:
+    """
+    供 ARS40X Cluster CSV 采集脚本填充惯导字段（雷达 CAN 无法给出的量）。
+    航向与平面坐标与 get_robot_pose() 使用同一套校准 / yaw offset；
+    速度为 INSPVAXA 东北天水平速度模长 √(v_e²+v_n²)（m/s）。
+    无有效 INS 时返回 None。
+    """
+    pose = get_robot_pose()
+    if pose is None:
+        return None
+    client = _get_client()
+    with client._lock:
+        ins = client._ins
+    if not ins:
+        return None
+    try:
+        vn = float(ins["v_n"])
+        ve = float(ins["v_e"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not (math.isfinite(vn) and math.isfinite(ve)):
+        return None
+    speed = math.hypot(ve, vn)
+    return {
+        "heading_deg": math.degrees(pose.yaw),
+        "speed_mps": speed,
+        "enu_x_m": pose.x,
+        "enu_y_m": pose.y,
+        "pitch_deg": float(ins.get("pitch_deg", float("nan"))),
+        "roll_deg": float(ins.get("roll_deg", float("nan"))),
+    }
+
+
+# 与「雷达帧」强制行对齐：仅在一次雷达 CSV 行写入前调用；行频=雷达帧频，不单独按 INS 插行。
+_ins_csv_hold: Optional[Dict[str, float]] = None
+_ins_csv_hold_wall_t: float = 0.0
+
+_ins_hold_max_s_env = os.getenv("INS_CLUSTER_CSV_HOLD_MAX_S", "").strip()
+try:
+    INS_CLUSTER_CSV_HOLD_MAX_S: Optional[float] = (
+        float(_ins_hold_max_s_env) if _ins_hold_max_s_env else None
+    )
+except ValueError:
+    INS_CLUSTER_CSV_HOLD_MAX_S = None
+
+
+def reset_ins_cluster_csv_row_hold() -> None:
+    """新开一段 CSV 录制时清空惯导 hold，避免与上一段串值。"""
+    global _ins_csv_hold, _ins_csv_hold_wall_t
+    _ins_csv_hold = None
+    _ins_csv_hold_wall_t = 0.0
+
+
+def sample_ins_for_radar_csv_row() -> Optional[Dict[str, float]]:
+    """
+    仅在每一「雷达帧」写 CSV 行前调用一次：行频=雷达帧频，不按惯导频率单独增行。
+
+    - 有新鲜 INS：更新缓存并返回。
+    - 短时无 INS：在 hold 窗口内返回上一帧惯导，保证与雷达行数 1:1。
+      环境变量 INS_CLUSTER_CSV_HOLD_MAX_S（秒）非空则超时后该帧惯导填 NaN；
+      未设置则一直沿用上一次有效惯导直至再次出现 INS。
+    """
+    global _ins_csv_hold, _ins_csv_hold_wall_t
+    fresh = get_ins_odometry_for_cluster_csv()
+    now = time.time()
+    if fresh is not None:
+        _ins_csv_hold = dict(fresh)
+        _ins_csv_hold_wall_t = now
+        return dict(fresh)
+
+    if _ins_csv_hold is None:
+        return None
+
+    if INS_CLUSTER_CSV_HOLD_MAX_S is not None:
+        if (now - _ins_csv_hold_wall_t) > float(INS_CLUSTER_CSV_HOLD_MAX_S):
+            return None
+
+    return dict(_ins_csv_hold)
+
+
 def shutdown_imu_client() -> None:
     """兼容旧代码：关闭 IMU 客户端及其接收线程。"""
     global _default_client

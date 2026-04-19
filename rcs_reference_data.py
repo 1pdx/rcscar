@@ -12,6 +12,7 @@ RCS_REFERENCE_CLASSES = OrderedDict(
     [
         ("pedistrain", "假人"),
         ("car", "气球车"),
+        ("evt_balloon_car", "EVT气球车"),
         ("bicycle", "自行车"),
         ("electric motor", "电动车"),
     ]
@@ -110,6 +111,32 @@ def _limits_car():
     }
 
 
+def _limits_evt_balloon_car():
+    # Source: EVT气球车毫米波雷达 RCS 反射率范围要求（表3）
+    # Distances (m): 5, 10, 20, 30, 40
+    # Two rows in the source image are labeled as upper/lower but appear swapped numerically.
+    # We normalize by taking lower=min(row_a,row_b), upper=max(row_a,row_b) per distance.
+    xp = np.asarray([5.0, 10.0, 20.0, 30.0, 40.0], dtype=float)
+    row_a = np.asarray([-3.0, 2.0, 8.0, 10.0, 10.0], dtype=float)
+    row_b = np.asarray([10.0, 13.0, 20.0, 22.0, 23.0], dtype=float)
+    lower_pts = np.minimum(row_a, row_b)
+    upper_pts = np.maximum(row_a, row_b)
+
+    t = np.arange(5.0, 52.0, 2.0, dtype=float)
+    lower = np.interp(t, xp, lower_pts, left=float(lower_pts[0]), right=float(lower_pts[-1]))
+    upper = np.interp(t, xp, upper_pts, left=float(upper_pts[0]), right=float(upper_pts[-1]))
+
+    ylim_min = float(np.min(lower)) - 5.0
+    ylim_max = float(np.max(upper)) + 5.0
+    return {
+        "x": t,
+        "lower": lower.astype(float),
+        "upper": upper.astype(float),
+        "xlim": (0.0, 50.0),
+        "ylim": (ylim_min, ylim_max),
+    }
+
+
 def _limits_bicycle(angle: str):
     x_limit = np.array(
         [1, 2, 3.4, 5, 7, 8.6, 10.3, 11, 13.7, 14.2, 17, 17.3, 20, 21.5, 27.4, 29.7, 31.3, 37, 40]
@@ -198,6 +225,8 @@ def get_rcs_reference_limits(obj_class, angle) -> Optional[Dict[str, np.ndarray]
         return _limits_pedistrain()
     if _class == "car":
         return _limits_car()
+    if _class == "evt_balloon_car":
+        return _limits_evt_balloon_car()
     if _class == "bicycle":
         return _limits_bicycle(ang)
     if _class == "electric motor":

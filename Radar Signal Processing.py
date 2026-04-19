@@ -1,21 +1,187 @@
 """
 Radar Signal Processing.py
 
-Radar processing utilities for ARS408 object output (0x60A/0x60B).
-UI removed; this module focuses on decoding, tracking, and stable target snapshots.
+ARS40X Cluster 配置（RadarCfg）、RCS 采样曲线与拟合工具。
+（已移除 CAN Object 0x60A/0x60B 解码与跟踪；RCS 管线使用 RcsMeasSample。）
 """
 
 from __future__ import annotations
 
 import math
 import time
-import threading
-from dataclasses import dataclass, field
-from collections import deque
-from typing import Dict, List, Optional, Tuple
+import warnings
+from dataclasses import dataclass
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 import can
+
+try:
+    from scipy.signal import savgol_filter as _savgol_filter
+except ImportError:  # pragma: no cover
+    _savgol_filter = None
+
+# 距离-RCS 拟合方法：
+# - "loess": 局部加权线性回归，能体现斜率变化且不产生高阶多项式振荡（默认）
+# - "polyfit": 兼容旧版本的高阶多项式拟合
+RCS_FIT_METHOD = "loess"
+# polyfit 配置（仅当 RCS_FIT_METHOD="polyfit" 时使用）
+RCS_POLYFIT_DEGREE = 20
+RCS_POLYFIT_DEG_CAP = 10
+RCS_FIT_POLY_SAMPLE_STEP_M = 0.1
+# loess 配置（仅当 RCS_FIT_METHOD="loess" 时使用）
+RCS_FIT_LOESS_BW_M = 2.0  # 带宽（m）；越大越平滑，越小越贴数据、越能体现斜率变化
+RCS_FIT_LOESS_MIN_POINTS = 8  # 每个 xq 至少需要的有效权重点数
+# 拟合前仅作用于 fit_curve 输入：沿距离排序后的平滑（不改落盘 rcs_raw）。
+# Savitzky–Golay：目标窗口长度（偶数会自动减 1 为奇数）；局部一阶多项式。
+RCS_CURVE_SG_WINDOW = 51
+RCS_CURVE_SG_POLY = 1
+# 未安装 scipy 时回退：抑峰中值 + 滑动平均
+RCS_CURVE_PEAK_MEDIAN_WIN = 7
+RCS_CURVE_PEAK_MA_WIN = 5
+_POLYFIT_RANK_WARN = getattr(np, "RankWarning", None)
+if _POLYFIT_RANK_WARN is None:
+    from numpy.exceptions import RankWarning as _POLYFIT_RANK_WARN
+
+
+def _odd_window_leq(k: int, n: int) -> int:
+    """将窗口长度压到不超过 n，且为奇数；返回值 <3 表示不做中值/卷积类平滑。"""
+    k = min(int(k), int(n))
+    if k < 3:
+        return 1
+    if k % 2 == 0:
+        k -= 1
+    return k if k >= 3 else 1
+
+
+def _median_filter_1d(y: np.ndarray, k: int) -> np.ndarray:
+    y = np.asarray(y, dtype=float)
+    n = int(y.size)
+    k = _odd_window_leq(k, n)
+    if k < 3:
+        return y.copy()
+    half = k // 2
+    padded = np.pad(y, (half, half), mode="edge")
+    out = np.empty(n, dtype=float)
+    for i in range(n):
+        out[i] = float(np.median(padded[i : i + k]))
+    return out
+
+
+def _moving_mean_1d(y: np.ndarray, k: int) -> np.ndarray:
+    y = np.asarray(y, dtype=float)
+    n = int(y.size)
+    k = _odd_window_leq(k, n)
+    if k < 3:
+        return y.copy()
+    half = k // 2
+    pad = np.pad(y, (half, half), mode="edge")
+    kernel = np.ones(k, dtype=float) / float(k)
+    return np.convolve(pad, kernel, mode="valid").astype(float)
+
+
+def _ensure_odd_sg_window(win: int, upper: int) -> int:
+    """与 dri_pipeline_gui._ensure_odd 相同：奇数窗口且不超过 upper。"""
+    win = max(3, min(int(win), int(upper)))
+    if win % 2 == 0:
+        win -= 1
+    return max(3, win)
+
+
+def _savgol_smooth_rcs_db_series(y: np.ndarray) -> np.ndarray:
+    """
+    对沿距离已排序的 RCS（dB）序列做 Savitzky–Golay：窗口 RCS_CURVE_SG_WINDOW、polyorder=RCS_CURVE_SG_POLY（一阶）。
+    """
+    y = np.asarray(y, dtype=float).copy()
+    n = int(y.size)
+    if n < 3 or _savgol_filter is None:
+        return y
+    # scipy：window_length 为不超过 n 的正奇数
+    max_odd = n if (n % 2 == 1) else (n - 1)
+    if max_odd < 3:
+        return y
+    w = _ensure_odd_sg_window(int(RCS_CURVE_SG_WINDOW), max_odd)
+    if w < 3:
+        return y
+    p = int(np.clip(int(RCS_CURVE_SG_POLY), 1, w - 1))
+    return np.asarray(_savgol_filter(y, window_length=w, polyorder=p, mode="nearest"), dtype=float)
+
+
+def _peak_smooth_rcs_series(y: np.ndarray) -> np.ndarray:
+    """沿已按 x 排序的序列平滑 RCS，再送入 LOESS / polyfit。优先 SG（窗口见 RCS_CURVE_SG_WINDOW），无 scipy 时抑峰中值+滑动平均。"""
+    y = np.asarray(y, dtype=float)
+    if y.size <= 1:
+        return y.copy()
+    if _savgol_filter is not None:
+        return _savgol_smooth_rcs_db_series(y)
+    ys = y.copy()
+    w_med = int(RCS_CURVE_PEAK_MEDIAN_WIN)
+    if w_med >= 3:
+        ys = _median_filter_1d(ys, w_med)
+    w_ma = int(RCS_CURVE_PEAK_MA_WIN)
+    if w_ma >= 3:
+        ys = _moving_mean_1d(ys, w_ma)
+    return ys
+
+
+def _loess_linear_predict(
+    x: np.ndarray,
+    y: np.ndarray,
+    xq: np.ndarray,
+    *,
+    bandwidth_m: float,
+    min_points: int,
+) -> np.ndarray:
+    """
+    局部加权线性回归（LOESS/LOWESS 的简化版）：在每个查询点 xq 上用高斯权重做一次加权线性拟合。
+    - 不依赖 scipy
+    - 能较好体现斜率随距离变化
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    xq = np.asarray(xq, dtype=float)
+    out = np.full_like(xq, np.nan, dtype=float)
+    bw = max(float(bandwidth_m), 1e-6)
+
+    for i in range(int(xq.size)):
+        xc = float(xq[i])
+        dx = x - xc
+        w = np.exp(-0.5 * (dx / bw) ** 2)
+        mask = np.isfinite(w) & np.isfinite(x) & np.isfinite(y) & (w > 1e-6)
+        if int(np.count_nonzero(mask)) < int(min_points):
+            continue
+        xm = x[mask]
+        ym = y[mask]
+        wm = w[mask]
+        sw = float(np.sum(wm))
+        if sw <= 1e-12:
+            continue
+
+        # 加权一阶最小二乘：y = a*x + b
+        mx = float(np.sum(wm * xm) / sw)
+        my = float(np.sum(wm * ym) / sw)
+        x0 = xm - mx
+        y0 = ym - my
+        sxx = float(np.sum(wm * x0 * x0))
+        if sxx <= 1e-12:
+            out[i] = my
+            continue
+        sxy = float(np.sum(wm * x0 * y0))
+        a = sxy / sxx
+        b = my - a * mx
+        out[i] = a * xc + b
+    return out
+
+
+# 距离-RCS 绘图/拟合过滤：仅影响分箱/拟合输入点，不影响原始记录落盘内容
+RCS_FILTER_X_MIN_M = 4.0
+RCS_FILTER_X_MAX_M = 50.0
+RCS_FILTER_ABS_Y_MAX_M = 1.2
+# 前方距离分箱宽度（m），用于拟合/直线拟合前的聚合
+RCS_DIST_BIN_M = 0.1
+
+# RCS 录制：绘图/拟合曲线的 RCS 平滑；落盘 rcs_raw 仍为瞬时
+RCS_POINT_RCS_EMA_ALPHA = 0.35
 
 
 # ========================= 0) SocketCAN init + RadarCfg =========================
@@ -29,17 +195,34 @@ def setup_socketcan(iface: str, bitrate: int) -> None:
     subprocess.run(["ip", "link", "set", iface, "up"], check=True)
 
 
-def send_radar_cfg_object(bus: can.BusABC, sensor_id: int = 0) -> None:
-    """Switch radar to objects output: payload 08 00 00 00 08 00 00 00."""
+# ARS40X RadarCfg：Cluster 扩展输出（0x600 / 0x701）
+RADAR_CFG_PAYLOAD_CLUSTER_EXT = bytes.fromhex("F8000000109C0000")
+
+
+def send_radar_cfg_payload(bus: can.BusABC, sensor_id: int = 0, payload: Optional[bytes] = None) -> None:
+    """下发 RadarCfg 原始 8 字节载荷（默认 Cluster）。"""
     cfg_id = 0x200 + int(sensor_id) * 0x10
-    payload = bytes.fromhex("08 00 00 00 08 00 00 00")
-    msg = can.Message(arbitration_id=cfg_id, is_extended_id=False, data=payload)
+    data = payload if payload is not None else RADAR_CFG_PAYLOAD_CLUSTER_EXT
+    msg = can.Message(arbitration_id=cfg_id, is_extended_id=False, data=data)
     for _ in range(20):
         bus.send(msg)
         time.sleep(0.05)
 
 
-def init_radar_object_output(
+def send_radar_cfg_cluster(bus: can.BusABC, sensor_id: int = 0) -> None:
+    """切换为 Cluster 输出（0x600 Cluster_0_Status + 0x701 Cluster_1_General）。"""
+    send_radar_cfg_payload(bus, sensor_id, RADAR_CFG_PAYLOAD_CLUSTER_EXT)
+
+
+def print_ars40x_terminal_mode_commands(sensor_id: int = 0) -> None:
+    """在终端打印 RadarCfg Cluster 切换命令（cansend）。"""
+    cid = 0x200 + int(sensor_id) * 0x10
+    ch = RADAR_CFG_PAYLOAD_CLUSTER_EXT.hex().upper()
+    print("[ARS40X RadarCfg] Cluster 模式 (0x600/0x701):")
+    print(f"  cansend can0 {cid:X}#{ch}")
+
+
+def init_radar_cluster_output(
     iface: str,
     bitrate: int,
     sensor_id: int = 0,
@@ -47,10 +230,11 @@ def init_radar_object_output(
     verify_timeout_s: float = 1.2,
     retries: int = 3,
 ) -> None:
-    """Initialize radar object output and verify 0x60A/0x60B are seen."""
+    """切换雷达为 Cluster 输出，并确认总线上出现 0x600 / 0x701。"""
     cfg_id = 0x200 + int(sensor_id) * 0x10
-    payload = bytes.fromhex("08 00 00 00 08 00 00 00")
-    msg = can.Message(arbitration_id=cfg_id, is_extended_id=False, data=payload)
+    msg = can.Message(
+        arbitration_id=cfg_id, is_extended_id=False, data=RADAR_CFG_PAYLOAD_CLUSTER_EXT
+    )
 
     for _ in range(int(retries)):
         bus = can.interface.Bus(channel=iface, interface="socketcan", bitrate=int(bitrate))
@@ -59,12 +243,16 @@ def init_radar_object_output(
                 bus.send(msg)
                 time.sleep(0.05)
 
+            off = int(sensor_id) * 0x10
+            id_stat = 0x600 + off
+            id_gen = 0x701 + off
             t0 = time.time()
             while time.time() - t0 < float(verify_timeout_s):
                 m = bus.recv(timeout=0.1)
                 if m is None or m.is_extended_id:
                     continue
-                if int(m.arbitration_id) in (0x60A, 0x60B):
+                aid = int(m.arbitration_id)
+                if aid in (id_stat, id_gen):
                     return
         finally:
             try:
@@ -73,39 +261,43 @@ def init_radar_object_output(
                 pass
         time.sleep(0.2)
 
-    raise RuntimeError("Radar object output init failed: no 0x60A/0x60B seen after cfg retries.")
+    raise RuntimeError(
+        "Radar cluster output init failed: no 0x600/0x701 cluster frames seen after cfg retries."
+    )
 
 
-# ========================= 1) Object decode (0x60B) =========================
-
-def extract_motorola_u(data: bytes, start: int, length: int) -> int:
-    """Motorola(big-endian) bit extraction (DBC @0)."""
-    if length <= 0:
-        return 0
-    if len(data) != 8:
-        data = data.ljust(8, b"\x00")[:8]
-    byte = start // 8
-    bit = start % 8  # 0=LSB, 7=MSB
-    val = 0
-    for _ in range(length):
-        if not (0 <= byte < 8):
-            break
-        b = (data[byte] >> bit) & 0x1
-        val = (val << 1) | int(b)
-        if bit == 0:
-            byte += 1
-            bit = 7
-        else:
-            bit -= 1
-    return val
+# ========================= 1) RCS 几何样本（圆周段关联等；非 CAN Object） =========================
 
 
-def _phys_m(data: bytes, start: int, length: int, offset: float, res: float) -> float:
-    return float(extract_motorola_u(data, start, length) * res + offset)
+def combine_rcs_db_incoherent_sum(rcs_db_values: Sequence[float]) -> Optional[float]:
+    """
+    同一目标多个散射点在 dBsm 下的非相干功率叠加：
+        P_lin = Σ 10^(RCS_i / 10)
+        RCS_tot = 10 × log10(P_lin)
+    适用于同一帧内多个簇（如 RCS00、RCS01）代表同一物体时的整体 RCS。
+    """
+    vals: List[float] = []
+    for v in rcs_db_values:
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(fv):
+            vals.append(fv)
+    if not vals:
+        return None
+    if len(vals) == 1:
+        return float(vals[0])
+    p_lin = 0.0
+    for v in vals:
+        p_lin += 10.0 ** (v / 10.0)
+    if p_lin <= 0.0 or not math.isfinite(p_lin):
+        return None
+    return float(10.0 * math.log10(p_lin))
 
 
 @dataclass
-class ObjMeas:
+class RcsMeasSample:
     oid: int
     x: float
     y: float
@@ -114,275 +306,46 @@ class ObjMeas:
     dyn: int
     rcs_db: float
     t: float
+    x_raw: float = float("nan")
+    y_raw: float = float("nan")
+    rcs_kf_db: float = float("nan")
 
     @property
     def rng(self) -> float:
         return float(math.hypot(self.x, self.y))
 
-    @property
-    def y_right(self) -> float:
-        return -float(self.y)
+    def xy_raw(self) -> Tuple[float, float]:
+        if math.isfinite(self.x_raw) and math.isfinite(self.y_raw):
+            return (float(self.x_raw), float(self.y_raw))
+        return (float(self.x), float(self.y))
 
 
-def decode_60B(data: bytes) -> ObjMeas:
-    oid = extract_motorola_u(data, 7, 8)
-    x = _phys_m(data, 15, 13, -500.0, 0.2)
-    y = _phys_m(data, 18, 11, -204.6, 0.2)
-    vx = _phys_m(data, 39, 10, -128.0, 0.25)
-    vy = _phys_m(data, 45, 9, -64.0, 0.25)
-    dyn = extract_motorola_u(data, 50, 3)
-    rcs = _phys_m(data, 63, 8, -64.0, 0.5)
-    return ObjMeas(oid=int(oid), x=float(x), y=float(y), vx=float(vx), vy=float(vy), dyn=int(dyn), rcs_db=float(rcs), t=time.time())
+# 兼容旧引用名
+ObjMeas = RcsMeasSample
 
 
-# ========================= 2) Tracker + clutter filtering =========================
-
-@dataclass
-class TrackState:
-    oid: int
-    last: Optional[ObjMeas] = None
-    last_update: float = 0.0
-    age: int = 0
-    miss: int = 0
-
-    x_hist: deque = field(default_factory=lambda: deque(maxlen=20))
-    y_hist: deque = field(default_factory=lambda: deque(maxlen=20))
-    rcs_hist: deque = field(default_factory=lambda: deque(maxlen=20))
-
-    x_ema: Optional[float] = None
-    y_ema: Optional[float] = None
-    rcs_ema: Optional[float] = None
-
-    stable_until: float = 0.0
-
-    def update(self, m: ObjMeas, ema_alpha: float = 0.25):
-        self.last = m
-        self.last_update = m.t
-        self.age += 1
-        self.miss = 0
-
-        self.x_hist.append(m.x)
-        self.y_hist.append(m.y)
-        self.rcs_hist.append(m.rcs_db)
-
-        if self.x_ema is None:
-            self.x_ema = m.x
-            self.y_ema = m.y
-            self.rcs_ema = m.rcs_db
-        else:
-            self.x_ema = (1.0 - ema_alpha) * self.x_ema + ema_alpha * m.x
-            self.y_ema = (1.0 - ema_alpha) * self.y_ema + ema_alpha * m.y
-            self.rcs_ema = (1.0 - ema_alpha) * self.rcs_ema + ema_alpha * m.rcs_db
-
-    def step_miss(self):
-        self.miss += 1
-
-    def stability_score(self) -> float:
-        if self.last is None:
-            return 0.0
-        age_term = min(1.0, self.age / 12.0)
-
-        px = float(np.std(self.x_hist)) if len(self.x_hist) > 3 else 0.0
-        py = float(np.std(self.y_hist)) if len(self.y_hist) > 3 else 0.0
-        pos_std = math.hypot(px, py)
-        pos_term = 1.0 / (1.0 + 0.8 * pos_std)
-
-        pr = float(np.std(self.rcs_hist)) if len(self.rcs_hist) > 3 else 0.0
-        rcs_term = 1.0 / (1.0 + 0.2 * pr)
-
-        dyn_bonus = 1.10 if self.last.dyn in (1, 3, 7) else 1.0
-        return float(age_term * pos_term * rcs_term * dyn_bonus)
-
-    def is_stable_now(self, min_age: int = 5, min_score: float = 0.30) -> bool:
-        return self.age >= int(min_age) and self.stability_score() >= float(min_score)
-
-    def is_display_stable(
-        self,
-        now: float,
-        hold_s: float = 0.8,
-        min_age: int = 5,
-        min_score: float = 0.30,
-    ) -> bool:
-        if self.is_stable_now(min_age=min_age, min_score=min_score):
-            self.stable_until = max(self.stable_until, now + hold_s)
-            return True
-        return now <= self.stable_until
-
-
-class ObjectTracker:
-    """Decode objects and maintain TrackState set."""
-
-    def __init__(self, iface: str, bitrate: int, roi_front_abs: float = 80.0, roi_lat_abs: float = 20.0):
-        self.iface = iface
-        self.bitrate = int(bitrate)
-        self.roi_front_abs = float(roi_front_abs)
-        self.roi_lat_abs = float(roi_lat_abs)
-
-        self.bus = can.interface.Bus(channel=self.iface, interface="socketcan", bitrate=self.bitrate)
-
-        self._lock = threading.Lock()
-        self._stop = False
-        self._th = threading.Thread(target=self._loop, daemon=True)
-
-        self._cycle: Dict[int, ObjMeas] = {}
-        self.tracks: Dict[int, TrackState] = {}
-
-        self._th.start()
-
-    def stop(self):
-        self._stop = True
-        try:
-            self._th.join(timeout=1.0)
-        except Exception:
-            pass
-        try:
-            self.bus.shutdown()
-        except Exception:
-            pass
-
-    def _loop(self):
-        while not self._stop:
-            msg = self.bus.recv(timeout=0.1)
-            if msg is None or msg.is_extended_id:
-                continue
-            cid = int(msg.arbitration_id)
-
-            if cid == 0x60B and len(msg.data) == 8:
-                m = decode_60B(bytes(msg.data))
-                if not (abs(m.x) <= self.roi_front_abs and abs(m.y) <= self.roi_lat_abs):
-                    continue
-                with self._lock:
-                    self._cycle[m.oid] = m
-                continue
-
-            if cid == 0x60A:
-                with self._lock:
-                    self._finalize()
-                continue
-
-    def _finalize(self):
-        now = time.time()
-        present = set(self._cycle.keys())
-
-        for oid, tr in list(self.tracks.items()):
-            if oid not in present:
-                tr.step_miss()
-
-        for oid, m in self._cycle.items():
-            tr = self.tracks.get(oid)
-            if tr is None:
-                tr = TrackState(oid=oid)
-                self.tracks[oid] = tr
-            tr.update(m)
-
-        stale = [oid for oid, tr in self.tracks.items() if now - tr.last_update > 1.5]
-        for oid in stale:
-            del self.tracks[oid]
-
-        self._cycle = {}
-
-    def snapshot_tracks(self) -> List[TrackState]:
-        with self._lock:
-            return list(self.tracks.values())
-
-
-class RadarObjectTracker:
-    """Provide stable target snapshots for UI."""
-
-    def __init__(
-        self,
-        iface: str,
-        bitrate: int,
-        roi_front_abs: float = 80.0,
-        roi_lat_abs: float = 20.0,
-        stable_min_age: int = 5,
-        stable_min_score: float = 0.30,
-        stable_hold_s: float = 0.8,
-        front_only: bool = True,
-    ) -> None:
-        self.tracker = ObjectTracker(iface=iface, bitrate=bitrate, roi_front_abs=roi_front_abs, roi_lat_abs=roi_lat_abs)
-        self.stable_min_age = int(stable_min_age)
-        self.stable_min_score = float(stable_min_score)
-        self.stable_hold_s = float(stable_hold_s)
-        self.front_only = bool(front_only)
-
-    def stop(self) -> None:
-        self.tracker.stop()
-
-    def get_targets_snapshot(self, min_score: Optional[float] = None) -> List[ObjMeas]:
-        now = time.time()
-        tracks = self.tracker.snapshot_tracks()
-        results: List[ObjMeas] = []
-        score_th = self.stable_min_score if min_score is None else float(min_score)
-        for tr in tracks:
-            if tr.last is None:
-                continue
-            if self.front_only and tr.last.x < 0.0:
-                continue
-            if not tr.is_display_stable(
-                now,
-                hold_s=self.stable_hold_s,
-                min_age=self.stable_min_age,
-                min_score=score_th,
-            ):
-                continue
-            if tr.age < self.stable_min_age or tr.stability_score() < score_th:
-                continue
-            results.append(tr.last)
-        return results
-
-    def get_best_stable_target(
-        self,
-        min_score: Optional[float] = None,
-        max_age_s: Optional[float] = None,
-        exclude_oid: Optional[int] = None,
-    ) -> Optional[ObjMeas]:
-        now = time.time()
-        score_th = self.stable_min_score if min_score is None else float(min_score)
-        exclude_oid_int = int(exclude_oid) if exclude_oid is not None else None
-
-        best: Optional[ObjMeas] = None
-        best_score = -1.0
-        best_update = -1.0
-        for tr in self.tracker.snapshot_tracks():
-            if tr.last is None:
-                continue
-            if self.front_only and tr.last.x < 0.0:
-                continue
-            if exclude_oid_int is not None and int(tr.last.oid) == exclude_oid_int:
-                continue
-            score = tr.stability_score()
-            if tr.age < self.stable_min_age or score < score_th:
-                continue
-            age_s = max(0.0, now - float(tr.last_update or 0.0))
-            if max_age_s is not None and age_s > float(max_age_s):
-                continue
-            if score > best_score or (
-                abs(score - best_score) <= 1e-9 and float(tr.last_update or 0.0) > best_update
-            ):
-                best = tr.last
-                best_score = score
-                best_update = float(tr.last_update or 0.0)
-        return best
-
-
-# ========================= 3) RCS collection =========================
+# ========================= 2) RCS collection =========================
 
 @dataclass
 class CurvePoint:
+    """RCS 采样点：几何 + RCS；x/y/rcs_filt 供绘图与拟合。"""
+
     t: float
+    x_raw: float
+    y_raw: float
+    r_raw: float
     x: float
     y: float
-    r_raw: float
     rcs_raw: float
     rcs_filt: float
 
 
 class RcsRunRecorder:
-    def __init__(self, max_segments: int = 0, dist_bin_m: float = 0.05):
+    def __init__(self, max_segments: int = 0, dist_bin_m: float = RCS_DIST_BIN_M):
         # Keep max_segments only for backward compatibility; recording is now continuous.
         self.max_segments = int(max_segments) if max_segments is not None else 0
         self.dist_bin_m = max(float(dist_bin_m), 1e-3)
+        self._rcs_plot_ema: Optional[float] = None
         self.reset()
 
     def reset(self):
@@ -390,7 +353,7 @@ class RcsRunRecorder:
         self.segments: List[List[CurvePoint]] = []
         self._cur: List[CurvePoint] = []
         self._ended = False
-        self._rcs_ema: Optional[float] = None
+        self._rcs_plot_ema = None
 
     @property
     def oid(self) -> Optional[int]:
@@ -407,15 +370,33 @@ class RcsRunRecorder:
     def ended(self) -> bool:
         return self._ended
 
-    def add_point(self, m: ObjMeas):
+    def add_point(self, m: RcsMeasSample):
         if self._ended:
             return
-        r = m.rng
-        if self._rcs_ema is None:
-            self._rcs_ema = m.rcs_db
+        xr, yr = m.xy_raw()
+        r_slant_raw = float(math.hypot(xr, yr))
+        xf, yf = float(m.x), float(m.y)
+        rcs_r = float(m.rcs_db)
+        # 绘图/拟合用 RCS：优先 rcs_kf_db；否则 EMA
+        if math.isfinite(getattr(m, "rcs_kf_db", float("nan"))):
+            rcs_f = float(getattr(m, "rcs_kf_db"))
         else:
-            self._rcs_ema = 0.85 * self._rcs_ema + 0.15 * m.rcs_db
-        pt = CurvePoint(t=m.t, x=m.x, y=m.y, r_raw=r, rcs_raw=m.rcs_db, rcs_filt=float(self._rcs_ema))
+            a = float(RCS_POINT_RCS_EMA_ALPHA)
+            if self._rcs_plot_ema is None:
+                self._rcs_plot_ema = rcs_r
+            else:
+                self._rcs_plot_ema = (1.0 - a) * float(self._rcs_plot_ema) + a * rcs_r
+            rcs_f = float(self._rcs_plot_ema)
+        pt = CurvePoint(
+            t=float(m.t),
+            x_raw=xr,
+            y_raw=yr,
+            r_raw=r_slant_raw,
+            x=xf,
+            y=yf,
+            rcs_raw=rcs_r,
+            rcs_filt=rcs_f,
+        )
         self.oid_hint = int(m.oid)
         self._cur.append(pt)
 
@@ -445,12 +426,17 @@ class RcsRunRecorder:
         if not points:
             return np.asarray([], dtype=float), np.asarray([], dtype=float)
 
+        # 绘图/拟合：距离用 x,y；RCS 用 rcs_filt
         x = np.asarray([p.x for p in points], dtype=float)
+        y_lat = np.asarray([p.y for p in points], dtype=float)
         y = np.asarray([p.rcs_filt for p in points], dtype=float)
+        mask = np.isfinite(x) & np.isfinite(y) & np.isfinite(y_lat)
+        mask &= (x >= float(RCS_FILTER_X_MIN_M)) & (x <= float(RCS_FILTER_X_MAX_M))
+        mask &= (np.abs(y_lat) <= float(RCS_FILTER_ABS_Y_MAX_M))
         if x_min is not None and x_max is not None:
-            mask = (x >= x_min) & (x <= x_max)
-            x = x[mask]
-            y = y[mask]
+            mask &= (x >= float(x_min)) & (x <= float(x_max))
+        x = x[mask]
+        y = y[mask]
         if x.size == 0:
             return np.asarray([], dtype=float), np.asarray([], dtype=float)
 
@@ -467,14 +453,6 @@ class RcsRunRecorder:
         y_out = np.asarray(y_mean, dtype=float)
         order = np.argsort(x_out)
         return x_out[order], y_out[order]
-
-    def raw_text(self) -> str:
-        lines = ["# segment_idx\tt(s)\tx(m)\ty(m)\trcs(dBsm)"]
-        segs = self.segments if self.segments else ([self._cur] if self._cur else [])
-        for si, seg in enumerate(segs):
-            for p in seg:
-                lines.append(f"{si}\t{p.t:.6f}\t{p.x:.3f}\t{p.y:.3f}\t{p.rcs_raw:.3f}")
-        return "\n".join(lines) + ("\n" if lines else "")
 
     def fitted_curve(self, grid: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         x_min = float(np.min(grid)) if grid.size else None
@@ -503,7 +481,45 @@ class RcsRunRecorder:
         x, y = self._distance_mean_xy(x_min=x_min, x_max=x_max)
         if x.size == 0:
             return None
-        return x, y
+        if x.size == 1:
+            return np.asarray([float(x[0])], dtype=float), np.asarray([float(y[0])], dtype=float)
+        y = _peak_smooth_rcs_series(y)
+        span = float(np.max(x) - np.min(x))
+        if span <= 1e-9:
+            return np.asarray([float(x[0])], dtype=float), np.asarray([float(np.mean(y))], dtype=float)
+
+        lo = float(np.min(x))
+        hi = float(np.max(x))
+        if x_min is not None:
+            lo = max(lo, float(x_min))
+        if x_max is not None:
+            hi = min(hi, float(x_max))
+        if hi <= lo:
+            lo, hi = float(np.min(x)), float(np.max(x))
+        if str(RCS_FIT_METHOD).strip().lower() == "polyfit":
+            deg = min(int(RCS_POLYFIT_DEGREE), int(RCS_POLYFIT_DEG_CAP), int(x.size) - 1)
+            deg = max(1, deg)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", _POLYFIT_RANK_WARN)
+                coef = np.polyfit(x.astype(float), y.astype(float), deg, rcond=1e-12)
+            step = max(float(RCS_FIT_POLY_SAMPLE_STEP_M), 1e-4)
+            n = max(2, int(np.ceil((hi - lo) / step)) + 1)
+            xs = np.linspace(lo, hi, n, dtype=float)
+            ys = np.polyval(coef, xs)
+            return xs, ys.astype(float)
+
+        # 默认：LOESS 局部加权线性回归，体现斜率变化且不产生高阶振荡
+        step = max(float(RCS_FIT_POLY_SAMPLE_STEP_M), 1e-4)
+        n = max(2, int(np.ceil((hi - lo) / step)) + 1)
+        xs = np.linspace(lo, hi, n, dtype=float)
+        ys = _loess_linear_predict(
+            x.astype(float),
+            y.astype(float),
+            xs,
+            bandwidth_m=float(RCS_FIT_LOESS_BW_M),
+            min_points=int(RCS_FIT_LOESS_MIN_POINTS),
+        )
+        return xs, ys.astype(float)
 
     def fit_line(self) -> Optional[Tuple[float, float]]:
         x, y = self._distance_mean_xy()
@@ -556,7 +572,7 @@ class AssocLock:
         self.r0 = 0.0
         self.lost_s = 0.0
 
-    def arm_from_meas(self, m: ObjMeas):
+    def arm_from_meas(self, m: RcsMeasSample):
         self.active = True
         self.last_oid = m.oid
         self.last_t = m.t
@@ -569,13 +585,13 @@ class AssocLock:
         self.r0 = m.rng
         self.lost_s = 0.0
 
-    def arm_from(self, m: ObjMeas):
+    def arm_from(self, m: RcsMeasSample):
         self.arm_from_meas(m)
 
     def disarm(self):
         self.reset()
 
-    def step(self, candidates: List[ObjMeas], now: float, cmd_speed_mps: float, hold_s: float = 1.2) -> Optional[ObjMeas]:
+    def step(self, candidates: List[RcsMeasSample], now: float, cmd_speed_mps: float, hold_s: float = 1.2) -> Optional[RcsMeasSample]:
         if not self.active:
             return None
 
@@ -591,7 +607,7 @@ class AssocLock:
         anchor_gate_y = 4.0
         gate_rcs = 8.0
 
-        best: Optional[ObjMeas] = None
+        best: Optional[RcsMeasSample] = None
         best_cost = 1e9
 
         for m in candidates:
@@ -654,5 +670,5 @@ class AssocLock:
         self.lost_s = 0.0
         return best
 
-    def associate(self, candidates: List[ObjMeas], now_t: float) -> Optional[ObjMeas]:
+    def associate(self, candidates: List[RcsMeasSample], now_t: float) -> Optional[RcsMeasSample]:
         return self.step(candidates, now_t, cmd_speed_mps=0.3, hold_s=1.2)

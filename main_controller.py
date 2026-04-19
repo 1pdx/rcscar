@@ -15,6 +15,11 @@ from car_control import ScoutMiniCAN
 from pi_power import PiPowerMonitor
 from can_init import init_can, CanInitResult
 
+try:
+    from ars40x_cluster_logger import ClusterCsvRuntime
+except ImportError:  # pragma: no cover
+    ClusterCsvRuntime = None  # type: ignore
+
 
 _RADAR_MODULE = None
 PathPoint = Tuple[float, float]
@@ -109,40 +114,49 @@ class MainController:
             print(f"[MainController] 初始化树莓派电量监控失败: {e}")
             self.pi_power = None
 
-        # Radar object tracker (ARS408 0x60A/0x60B)
-        self.radar: Optional[object] = None
         self._radar_selected_id: Optional[int] = None
+        self.cluster_csv_runtime: Optional[Any] = None
         radar_mod = None
         if self._is_linux:
             try:
                 radar_mod = _load_radar_processing_module()
             except Exception as e:
                 print(f"[MainController] Radar module load failed: {e}")
-            if radar_mod is not None:
-                if self.can_init_result is not None and self.can_init_result.ok:
-                    try:
-                        radar_mod.init_radar_object_output(
-                            iface="can0",
-                            bitrate=500000,
-                            sensor_id=0,
-                            send_count=20,
-                            verify_timeout_s=1.2,
-                            retries=2,
-                        )
-                    except Exception as e:
-                        print(f"[MainController] Radar object output init failed: {e}")
+            if radar_mod is not None and self.can_init_result is not None and self.can_init_result.ok:
                 try:
-                    self.radar = radar_mod.RadarObjectTracker(
+                    radar_mod.init_radar_cluster_output(
                         iface="can0",
                         bitrate=500000,
-                        roi_front_abs=80.0,
-                        roi_lat_abs=20.0,
+                        sensor_id=0,
+                        send_count=20,
+                        verify_timeout_s=1.2,
+                        retries=2,
+                    )
+                    radar_mod.print_ars40x_terminal_mode_commands(sensor_id=0)
+                    print(
+                        "[MainController] 雷达已配置为 Cluster 模式；Object 列表输出已停用。"
                     )
                 except Exception as e:
-                    print(f"[MainController] Radar tracker init failed: {e}")
-                    self.radar = None
+                    print(f"[MainController] Radar cluster output init failed: {e}")
+            if (
+                ClusterCsvRuntime is not None
+                and self.can_init_result is not None
+                and self.can_init_result.ok
+            ):
+                try:
+                    self.cluster_csv_runtime = ClusterCsvRuntime(
+                        iface="can0",
+                        bitrate=500000,
+                        sensor_id=0,
+                        enable_ins=True,
+                    )
+                    self.cluster_csv_runtime.start()
+                    print("[MainController] Cluster CSV 接收线程已启动（与底盘共用 can0）。")
+                except Exception as e:
+                    print(f"[MainController] Cluster CSV runtime start failed: {e}")
+                    self.cluster_csv_runtime = None
         else:
-            print("[MainController] Non-Linux system, skip radar tracker init.")
+            print("[MainController] Non-Linux system, skip radar cluster init.")
 
         # Battery percent mapping for the chassis (adjust if needed).
         self._car_batt_v_min = 23.0
@@ -180,6 +194,38 @@ class MainController:
             )
             return False
         return True
+
+    def begin_cluster_rcs_capture(
+        self,
+        output_dir: str,
+        stem: str,
+        run_number: int = 1,
+        calibration: Optional[Any] = None,
+    ) -> bool:
+        """开始一段 Cluster RCS CSV 写入（与 ars40x_cluster_logger / DRI Raw 元数据格式一致）。"""
+        if self.cluster_csv_runtime is None:
+            return False
+        try:
+            self.cluster_csv_runtime.begin_recording(
+                output_dir,
+                run_number=run_number,
+                stem=stem,
+                calibration=calibration,
+            )
+            return True
+        except Exception as e:
+            print(f"[MainController] begin_cluster_rcs_capture failed: {e}")
+            return False
+
+    def end_cluster_rcs_capture(self) -> Optional[str]:
+        """结束当前 CSV 采集，返回文件路径。"""
+        if self.cluster_csv_runtime is None:
+            return None
+        try:
+            return self.cluster_csv_runtime.end_recording()
+        except Exception as e:
+            print(f"[MainController] end_cluster_rcs_capture failed: {e}")
+            return None
 
     @staticmethod
     def _wrap_angle(angle: float) -> float:
@@ -667,9 +713,9 @@ class MainController:
                 clockwise = angle > 0
             clockwise = bool(clockwise)
             self._update_planned_circle(parent_window, pose, radius, abs(angle), clockwise)
-            # 启动圆周运动线程（极坐标轨道控制）
+            # 启动圆周运动线程（Stanley 路径跟踪，见 car_control.move_circle）
             t = threading.Thread(
-                target=self.car.move_circle_orbit,
+                target=self.car.move_circle,
                 args=(radius, angle, speed, clockwise),
                 kwargs={
                     "metrics_callback": getattr(parent_window, "_emit_tracking_metrics", None),
@@ -706,30 +752,12 @@ class MainController:
         )
 
     def select_radar_target(self, parent_window) -> None:
-        """Select a stable radar target for RCS recording."""
-        if self.radar is None:
-            QtWidgets.QMessageBox.information(
-                parent_window,
-                "雷达未启用",
-                "当前未接入雷达，无法选择或锁定目标。",
-            )
-            return
-
-        target = self.radar.get_best_stable_target()
-        if target is None:
-            QtWidgets.QMessageBox.information(
-                parent_window,
-                "无稳定目标",
-                "当前未检测到稳定目标，请稍后再试。",
-            )
-            return
-
-        self._radar_selected_id = int(target.oid)
-        parent_window.tracked_target_id = int(target.oid)
+        """ARS40X 仅 Cluster 输出：在主界面雷达图中点击簇点可选中序号。"""
         QtWidgets.QMessageBox.information(
             parent_window,
-            "目标已选择",
-            f"已选择目标 ID={target.oid} (x={target.x:.1f}m, y={target.y:.1f}m, rcs={target.rcs_db:.1f}dBsm)",
+            "选择簇目标",
+            "请在主界面「雷达 Cluster 检查图」中直接点击散点；"
+            "选中序号会显示在状态栏（不再使用 CAN Object 列表）。",
         )
 
     def set_selected_radar_id(self, oid: int) -> None:
@@ -1023,30 +1051,17 @@ class MainController:
             can_text = "CAN 初始化: 当前系统非 Linux，socketcan 功能已禁用"
         return can_text
 
-    # 雷达功能已移除，保留兼容接口
     def get_radar_status(self) -> str:
-        if self.radar is None:
-            return "锁定目标: 雷达未启用"
-
-        targets = self.radar.get_targets_snapshot()
-        if not targets:
-            return "锁定目标: --"
-
-        if self._radar_selected_id is not None:
-            t = next((m for m in targets if m.oid == self._radar_selected_id), None)
-            if t is not None:
-                return f"锁定目标: ID={t.oid} x={t.x:.1f}m y={t.y:.1f}m rcs={t.rcs_db:.1f}dBsm"
-
-        best = self.radar.get_best_stable_target()
-        if best is None:
-            return f"锁定目标: {len(targets)}个"
-        return f"锁定目标: ID={best.oid} x={best.x:.1f}m y={best.y:.1f}m rcs={best.rcs_db:.1f}dBsm"
+        if self.cluster_csv_runtime is not None:
+            base = "雷达: Cluster(0x600/0x701) | 跟踪图为簇解析"
+            if self._radar_selected_id is not None:
+                return f"{base} | 选中序号={int(self._radar_selected_id)}"
+            return f"{base} | 点击散点可选中簇序号"
+        return "雷达: Cluster 接收未启动（检查 CAN）"
 
     def get_stable_radar_targets(self, min_confidence: float = 0.7) -> List:
-        if self.radar is None:
-            return []
-        # min_confidence maps to stability score threshold.
-        return self.radar.get_targets_snapshot(min_score=min_confidence)
+        del min_confidence
+        return []
 
     # ========= 规划轨迹（ENU） =========
 

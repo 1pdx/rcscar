@@ -19,7 +19,7 @@ STANLEY_LATERAL_PD_KP_STORED: float = 0.04
 STANLEY_LATERAL_PD_KD_STORED: float = 0.0
 
 FORWARD_STRAIGHT_TRACKING_KWARGS: Dict[str, Any] = {
-    "lookahead_distance": 2.0,
+    "lookahead_distance": 4.0,
     "stanley_gain": 0.4,
     "stanley_softening_speed_mps": 0.55,
     "straight_switch_pause_s": 0.12,
@@ -226,9 +226,15 @@ class ScoutMiniCAN:
         self._motion_logged = False
         self._rx_drain_max = int(os.getenv("SCOUT_CAN_RX_DRAIN_MAX", "32") or "32")
 
-        # 新增PID控制器（提高积分累积上限与整体控制力度）
-        self.heading_pid = PIDController(kp=4.0, ki=0.4, kd=0.8, i_output_limit=6.0)  # 航向角PID
-        self.lateral_pid = PIDController(kp=3.8, ki=0.35, kd=0.6, i_output_limit=6.0)  # 横向误差PID
+        # Stanley 输出的角速度 w 闭环 PID：用底盘反馈角速度跟踪 w_stanley
+        # 参数按需求：P=1, I=0, D=0.5
+        self.stanley_w_pid = PIDController(
+            kp=0.5,
+            ki=0.0,
+            kd=-0.5,
+            output_limits=(-self.MAX_ANGULAR_RADPS, self.MAX_ANGULAR_RADPS),
+            i_output_limit=self.MAX_ANGULAR_RADPS,
+        )
 
         # 虚拟模式支持
         self._virtual_mode = (channel == "virtual" or interface == "virtual")
@@ -335,6 +341,73 @@ class ScoutMiniCAN:
         """
         self._stop_flag.set()
         self._send_motion_command(0.0, 0.0)
+
+    def rotate_to_heading(
+        self,
+        target_yaw_rad: float,
+        *,
+        update_pose: Callable[[], Optional[PoseSolution]] = get_robot_pose,
+        dt: float = 0.02,
+        timeout_s: float = 6.0,
+        yaw_tolerance_rad: float = math.radians(3.0),
+        max_w_radps: float = 1.2,
+        min_w_radps: float = 0.18,
+    ) -> bool:
+        """
+        原地转向对齐到目标航向（弧度）。
+
+        说明：
+        - 该方法用于 UI 侧“切段前对齐航向”，避免调用不存在接口导致线程崩溃。
+        - 仅下发 (v=0,w!=0)；若无位姿则直接返回 False。
+        """
+        try:
+            target_yaw = float(target_yaw_rad)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(target_yaw):
+            return False
+
+        pose0 = update_pose()
+        if pose0 is None:
+            return False
+
+        started = time.time()
+        self._stop_flag.clear()
+        ok = False
+        stable_count = 0
+        stable_needed = max(1, int(round(0.25 / max(1e-3, float(dt)))))  # ~0.25s
+        dt_eff = float(dt) if dt and float(dt) > 0 else 0.02
+
+        while not self._stop_flag.is_set():
+            now = time.time()
+            if timeout_s is not None and float(timeout_s) > 0 and (now - started) >= float(timeout_s):
+                break
+
+            pose = update_pose()
+            if pose is None:
+                break
+
+            err = _wrap_angle(float(target_yaw) - float(pose.yaw))
+            if abs(err) <= float(yaw_tolerance_rad):
+                stable_count += 1
+                self._send_motion_command(0.0, 0.0)
+                if stable_count >= stable_needed:
+                    ok = True
+                    break
+                time.sleep(dt_eff)
+                continue
+
+            stable_count = 0
+            # 简单 P 控制：角速度与误差成正比，同时限幅与最小输出（克服静摩擦）
+            w = 1.6 * float(err)
+            w = _sat(w, -abs(float(max_w_radps)), abs(float(max_w_radps)))
+            if abs(w) < abs(float(min_w_radps)):
+                w = math.copysign(abs(float(min_w_radps)), w)
+            self._send_motion_command(0.0, float(w))
+            time.sleep(dt_eff)
+
+        self._send_motion_command(0.0, 0.0)
+        return bool(ok)
 
     def close(self) -> None:
         """
@@ -449,6 +522,10 @@ class ScoutMiniCAN:
         clockwise: bool = False,
         dt: float = 0.02,
         update_pose: Callable[[], Optional[PoseSolution]] = get_robot_pose,
+        metrics_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        sample_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        run_label: Optional[str] = None,
+        record_context: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
         圆周运动 (PID 路径跟踪)，按轨迹角度和半径给定。
@@ -504,8 +581,9 @@ class ScoutMiniCAN:
         phi0 = math.atan2(y0 - cy, x0 - cx)
         total_angle_rad = math.radians(angle_deg)
         arc_len = radius_m * total_angle_rad
-        step = max(0.1, min(0.5, arc_len / 80.0))
-        n = max(10, min(400, int(arc_len / step)))
+        # 圆弧离散更密：沿弧长约每 0.06m 一个点（上限防止点数过多）
+        target_spacing_m = 0.06
+        n = max(20, min(1000, int(math.ceil(arc_len / max(1e-6, target_spacing_m)))))
         waypoints: List[Tuple[float, float]] = []
         for i in range(n + 1):
             dphi = sign * total_angle_rad * i / n
@@ -523,11 +601,16 @@ class ScoutMiniCAN:
             dt=dt,
             update_pose=update_pose,
             lookahead_distance=0.4,
+            stanley_gain=0.4,
             smoothing_strength=0.8,
             smoothing_strength_curve=0.88,
             w_bias_tau=0.9,
             w_bias_hf_gain=0.25,
             max_w_rate=3.0,
+            metrics_callback=metrics_callback,
+            sample_callback=sample_callback,
+            run_label=run_label,
+            record_context=record_context,
         )
 
     def move_circle_orbit(
@@ -919,7 +1002,7 @@ class ScoutMiniCAN:
         if float(speed_sign) < 0.0:
             # 倒车段：保守一点的角速度变化、稍大前瞻
             return {
-                "lookahead_distance": 2.0,
+                "lookahead_distance": 4.0,
                 "tracking_mode": "stanley",
                 "stanley_gain": 0.4,
                 "stanley_softening_speed_mps": 0.55,
@@ -950,7 +1033,7 @@ class ScoutMiniCAN:
         speed_mps: float = 0.5,
         dt: float = 0.02,
         update_pose: Callable[[], Optional[PoseSolution]] = get_robot_pose,
-        lookahead_distance: float = 2.0,
+        lookahead_distance: float = 4.0,
         slow_down_dist: Optional[float] = None,
         arrival_dist: float = 0.05,
         smoothing_strength: float = 0.6,
@@ -971,6 +1054,7 @@ class ScoutMiniCAN:
         stanley_lateral_pd_kp: float = 0.0,
         stanley_lateral_pd_kd: float = 0.0,
         stanley_lateral_pd_output_limit_radps: float = 1.15,
+        enable_stanley_w_pid: bool = False,
         **_extra: Any,
     ) -> None:
         """
@@ -1081,9 +1165,11 @@ class ScoutMiniCAN:
         w_bias_tau = max(0.05, float(w_bias_tau))
         w_bias_hf_gain = max(0.0, min(1.0, float(w_bias_hf_gain)))
 
-        # 重置PID控制器
-        self.heading_pid.reset()
-        self.lateral_pid.reset()
+        # 重置控制器（仅用于可选的 Stanley-w PID 抑制）
+        try:
+            self.stanley_w_pid.reset()
+        except Exception:
+            pass
 
         mode = str(tracking_mode or "").strip().lower()
         # 移除纯 PID：无论外部传 pid/其他值，都强制走 Stanley 逻辑
@@ -1166,6 +1252,7 @@ class ScoutMiniCAN:
 
             stanley_term = 0.0
             stanley_lateral_pd_out = 0.0
+            stanley_w_pid_out = 0.0
             if use_stanley:
                 speed_term = max(
                     0.05,
@@ -1173,6 +1260,10 @@ class ScoutMiniCAN:
                 )
                 stanley_term = math.atan2(float(stanley_gain) * float(lateral_error), speed_term)
                 stanley_output = _wrap_angle(float(heading_error) + float(stanley_term))
+                try:
+                    dt_eff_stanley_pid = float(dt) if dt and float(dt) > 0 else 0.02
+                except Exception:
+                    dt_eff_stanley_pid = 0.02
                 if abs(float(stanley_lateral_pd_kp)) > 1e-9 or abs(float(stanley_lateral_pd_kd)) > 1e-9:
                     try:
                         dt_eff_pd = float(dt) if dt and float(dt) > 0 else 0.02
@@ -1188,7 +1279,35 @@ class ScoutMiniCAN:
                     ) * float(derr)
                     lim = max(0.05, abs(float(stanley_lateral_pd_output_limit_radps)))
                     stanley_lateral_pd_out = _sat(stanley_lateral_pd_out, -lim, lim)
-                angular_speed = float(stanley_output) + float(stanley_lateral_pd_out)
+
+                # 先得到 Stanley 的角速度输出（用于满足横向/航向误差）
+                w_stanley = float(stanley_output) + float(stanley_lateral_pd_out)
+
+                if enable_stanley_w_pid:
+                    # 在横向/航向误差“足够小”时，再对 w_stanley 做 PID 抑制，使 w 趋于 0
+                    # 误差越小，抑制越强；误差较大时不介入，避免削弱转向纠偏能力
+                    lat_thresh_m = 0.20
+                    head_thresh_rad = math.radians(10.0)
+                    lat_ratio = abs(float(lateral_error)) / max(1e-6, lat_thresh_m)
+                    head_ratio = abs(float(heading_error)) / max(1e-6, head_thresh_rad)
+                    scale = 1.0 - max(lat_ratio, head_ratio)
+                    scale = max(0.0, min(1.0, float(scale)))
+                    if scale <= 1e-6:
+                        # 误差大：不做 w->0 抑制，且避免积分累积影响后续转向
+                        try:
+                            self.stanley_w_pid.reset()
+                        except Exception:
+                            pass
+                        stanley_w_pid_out = 0.0
+                    else:
+                        # 让 w 朝 0 收敛：error = 0 - w_stanley
+                        stanley_w_pid_out = float(
+                            self.stanley_w_pid.update(float(-w_stanley), dt=dt_eff_stanley_pid)
+                        ) * float(scale)
+                else:
+                    stanley_w_pid_out = 0.0
+
+                angular_speed = float(w_stanley) + float(stanley_w_pid_out)
                 lateral_correction = float(stanley_output)
                 heading_correction = 0.0
             else:
@@ -1301,15 +1420,22 @@ class ScoutMiniCAN:
                         # UI 字段名沿用历史：softening_distance_m（本实现为速度软化项，数值仍可用于对比）
                         "stanley_softening_distance_m": float(stanley_softening_speed_mps),
                         "stanley_term_rad": float(stanley_term),
-                        "lateral_pid_kp": float(getattr(self.lateral_pid, "kp", 0.0) or 0.0),
-                        "lateral_pid_ki": float(getattr(self.lateral_pid, "ki", 0.0) or 0.0),
-                        "lateral_pid_kd": float(getattr(self.lateral_pid, "kd", 0.0) or 0.0),
-                        "heading_pid_kp": float(getattr(self.heading_pid, "kp", 0.0) or 0.0),
-                        "heading_pid_ki": float(getattr(self.heading_pid, "ki", 0.0) or 0.0),
-                        "heading_pid_kd": float(getattr(self.heading_pid, "kd", 0.0) or 0.0),
-                        "yaw_rate_pid_kp": 0.0,
-                        "yaw_rate_pid_ki": 0.0,
-                        "yaw_rate_pid_kd": 0.0,
+                        "stanley_w_pid_output_radps": float(stanley_w_pid_out),
+                        "lateral_pid_kp": 0.0,
+                        "lateral_pid_ki": 0.0,
+                        "lateral_pid_kd": 0.0,
+                        "heading_pid_kp": 0.0,
+                        "heading_pid_ki": 0.0,
+                        "heading_pid_kd": 0.0,
+                        "yaw_rate_pid_kp": float(getattr(self.stanley_w_pid, "kp", 0.0) or 0.0)
+                        if enable_stanley_w_pid
+                        else 0.0,
+                        "yaw_rate_pid_ki": float(getattr(self.stanley_w_pid, "ki", 0.0) or 0.0)
+                        if enable_stanley_w_pid
+                        else 0.0,
+                        "yaw_rate_pid_kd": float(getattr(self.stanley_w_pid, "kd", 0.0) or 0.0)
+                        if enable_stanley_w_pid
+                        else 0.0,
                         "cmd_v_mps": float(cmd_v),
                         "cmd_w_radps": float(cmd_w),
                         "desired_v_mps": float(desired_v),
