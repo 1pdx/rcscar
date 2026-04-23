@@ -34,7 +34,7 @@ RCS_FIT_LOESS_BW_M = 2.0  # 带宽（m）；越大越平滑，越小越贴数据
 RCS_FIT_LOESS_MIN_POINTS = 8  # 每个 xq 至少需要的有效权重点数
 # 拟合前仅作用于 fit_curve 输入：沿距离排序后的平滑（不改落盘 rcs_raw）。
 # Savitzky–Golay：目标窗口长度（偶数会自动减 1 为奇数）；局部一阶多项式。
-RCS_CURVE_SG_WINDOW = 51
+RCS_CURVE_SG_WINDOW = 39
 RCS_CURVE_SG_POLY = 1
 # 未安装 scipy 时回退：抑峰中值 + 滑动平均
 RCS_CURVE_PEAK_MEDIAN_WIN = 7
@@ -175,10 +175,13 @@ def _loess_linear_predict(
 
 # 距离-RCS 绘图/拟合过滤：仅影响分箱/拟合输入点，不影响原始记录落盘内容
 RCS_FILTER_X_MIN_M = 4.0
-RCS_FILTER_X_MAX_M = 50.0
+RCS_FILTER_X_MAX_M = 60.0
 RCS_FILTER_ABS_Y_MAX_M = 1.2
 # 前方距离分箱宽度（m），用于拟合/直线拟合前的聚合
 RCS_DIST_BIN_M = 0.1
+# 同一分箱内若 |Δt| ≤ 该值（s），视为同一雷达周期内多反射点，RCS 按功率叠加：
+#   P_total = Σ 10^(RCS/10)，RCS_total = 10×log10(P_total)（与 RCS00+RCS01 合并一致）
+RCS_BIN_INCOHERENT_SUM_MAX_TIME_SPAN_S = 0.08
 
 # RCS 录制：绘图/拟合曲线的 RCS 平滑；落盘 rcs_raw 仍为瞬时
 RCS_POINT_RCS_EMA_ALPHA = 0.35
@@ -271,10 +274,10 @@ def init_radar_cluster_output(
 
 def combine_rcs_db_incoherent_sum(rcs_db_values: Sequence[float]) -> Optional[float]:
     """
-    同一目标多个散射点在 dBsm 下的非相干功率叠加：
-        P_lin = Σ 10^(RCS_i / 10)
-        RCS_tot = 10 × log10(P_lin)
-    适用于同一帧内多个簇（如 RCS00、RCS01）代表同一物体时的整体 RCS。
+    同一帧内多个散射点在 dBsm 下的非相干功率线性叠加（绘图/解析与 DRI 一致）：
+        P_total = Σ 10^(RCS_i / 10)
+        RCS_total = 10 × log10(P_total)
+    两项时即 RCS00 与 RCS01 的合并；也用于分箱绘图时同一雷达周期内多点合并。
     """
     vals: List[float] = []
     for v in rcs_db_values:
@@ -430,13 +433,15 @@ class RcsRunRecorder:
         x = np.asarray([p.x for p in points], dtype=float)
         y_lat = np.asarray([p.y for p in points], dtype=float)
         y = np.asarray([p.rcs_filt for p in points], dtype=float)
-        mask = np.isfinite(x) & np.isfinite(y) & np.isfinite(y_lat)
+        t = np.asarray([p.t for p in points], dtype=float)
+        mask = np.isfinite(x) & np.isfinite(y) & np.isfinite(y_lat) & np.isfinite(t)
         mask &= (x >= float(RCS_FILTER_X_MIN_M)) & (x <= float(RCS_FILTER_X_MAX_M))
         mask &= (np.abs(y_lat) <= float(RCS_FILTER_ABS_Y_MAX_M))
         if x_min is not None and x_max is not None:
             mask &= (x >= float(x_min)) & (x <= float(x_max))
         x = x[mask]
         y = y[mask]
+        t = t[mask]
         if x.size == 0:
             return np.asarray([], dtype=float), np.asarray([], dtype=float)
 
@@ -444,10 +449,20 @@ class RcsRunRecorder:
         uniq_bins = np.unique(bin_ids)
         x_mean = []
         y_mean = []
+        t_same = float(RCS_BIN_INCOHERENT_SUM_MAX_TIME_SPAN_S)
         for bid in uniq_bins:
-            mask = bin_ids == bid
-            x_mean.append(float(np.mean(x[mask])))
-            y_mean.append(float(np.mean(y[mask])))
+            mbin = bin_ids == bid
+            xs_b = x[mbin]
+            ys_b = y[mbin]
+            ts_b = t[mbin]
+            x_mean.append(float(np.mean(xs_b)))
+            if ys_b.size <= 1:
+                y_mean.append(float(ys_b[0]))
+            elif float(np.max(ts_b) - np.min(ts_b)) <= t_same:
+                cr = combine_rcs_db_incoherent_sum(ys_b.tolist())
+                y_mean.append(float(cr) if cr is not None else float(np.mean(ys_b)))
+            else:
+                y_mean.append(float(np.mean(ys_b)))
 
         x_out = np.asarray(x_mean, dtype=float)
         y_out = np.asarray(y_mean, dtype=float)

@@ -1020,6 +1020,40 @@ def get_ins_odometry_for_cluster_csv() -> Optional[Dict[str, float]]:
     }
 
 
+# Cluster CSV（DRI Raw）：前进直线段落盘时可将第 2 列 R 写为「沿当前路径到终点的剩余距离」
+# （由路径跟踪线程写入；无覆盖时仍用雷达几何斜距 hypot(DX,DY)）。
+_cluster_csv_path_rem_lock = threading.Lock()
+_cluster_csv_straight_path_remaining_m: Optional[float] = None
+
+
+def set_cluster_csv_straight_path_remaining_m(dist_m: Optional[float]) -> None:
+    """
+    由 car_control.follow_path_with_pid 在控制周期内更新。
+    dist_m 为 None 或非有限值时清除覆盖，Cluster 行 R 恢复为雷达几何距离。
+    """
+    global _cluster_csv_straight_path_remaining_m
+    with _cluster_csv_path_rem_lock:
+        if dist_m is None:
+            _cluster_csv_straight_path_remaining_m = None
+            return
+        try:
+            v = float(dist_m)
+        except (TypeError, ValueError):
+            _cluster_csv_straight_path_remaining_m = None
+            return
+        if not math.isfinite(v):
+            _cluster_csv_straight_path_remaining_m = None
+            return
+        _cluster_csv_straight_path_remaining_m = max(0.0, v)
+
+
+def get_cluster_csv_straight_path_remaining_m() -> Optional[float]:
+    with _cluster_csv_path_rem_lock:
+        if _cluster_csv_straight_path_remaining_m is None:
+            return None
+        return float(_cluster_csv_straight_path_remaining_m)
+
+
 # 与「雷达帧」强制行对齐：仅在一次雷达 CSV 行写入前调用；行频=雷达帧频，不单独按 INS 插行。
 _ins_csv_hold: Optional[Dict[str, float]] = None
 _ins_csv_hold_wall_t: float = 0.0
@@ -1038,6 +1072,7 @@ def reset_ins_cluster_csv_row_hold() -> None:
     global _ins_csv_hold, _ins_csv_hold_wall_t
     _ins_csv_hold = None
     _ins_csv_hold_wall_t = 0.0
+    set_cluster_csv_straight_path_remaining_m(None)
 
 
 def sample_ins_for_radar_csv_row() -> Optional[Dict[str, float]]:

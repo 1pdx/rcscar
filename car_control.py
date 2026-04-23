@@ -7,7 +7,11 @@ from typing import Any, Dict, Optional, Callable, List, Tuple
 
 import can
 
-from imu_gnss_pose import get_robot_pose, PoseSolution
+from imu_gnss_pose import (
+    get_robot_pose,
+    PoseSolution,
+    set_cluster_csv_straight_path_remaining_m,
+)
 
 #
 # UI 侧会导入该常量用于复用直线前进段的跟踪参数。
@@ -21,7 +25,7 @@ STANLEY_LATERAL_PD_KD_STORED: float = 0.0
 FORWARD_STRAIGHT_TRACKING_KWARGS: Dict[str, Any] = {
     "lookahead_distance": 4.0,
     "stanley_gain": 0.4,
-    "stanley_softening_speed_mps": 0.55,
+    "stanley_softening_speed_mps": 1.0,
     "straight_switch_pause_s": 0.12,
     "stanley_lateral_pd_kp": 0.0,
     "stanley_lateral_pd_kd": 0.0,
@@ -512,6 +516,7 @@ class ScoutMiniCAN:
             update_pose=update_pose,
             arrival_dist=straight_arrival_dist_m,
             slow_down_dist=slow_down_dist,
+            stanley_softening_speed_mps=1.0,
         )
 
     def move_circle(
@@ -738,6 +743,7 @@ class ScoutMiniCAN:
             f"R={radius_m:.2f}m, angle={angle_deg:.1f}deg, cw={bool(clockwise)}"
         )
 
+        set_cluster_csv_straight_path_remaining_m(None)
         while not self._stop_flag.is_set():
             pose = update_pose()
             if pose is None:
@@ -936,6 +942,7 @@ class ScoutMiniCAN:
             time.sleep(dt_eff)
 
         self._send_motion_command(0.0, 0.0)
+        set_cluster_csv_straight_path_remaining_m(None)
         if self._stop_flag.is_set() and exit_reason == "loop_exit":
             exit_reason = "stop_flag"
         duration_s = max(0.0, time.time() - started_wall_ts)
@@ -1005,7 +1012,7 @@ class ScoutMiniCAN:
                 "lookahead_distance": 4.0,
                 "tracking_mode": "stanley",
                 "stanley_gain": 0.4,
-                "stanley_softening_speed_mps": 0.55,
+                "stanley_softening_speed_mps": 1.0,
                 "stanley_lateral_pd_kp": 0.0,
                 "stanley_lateral_pd_kd": 0.0,
                 "stanley_lateral_pd_output_limit_radps": 1.15,
@@ -1018,7 +1025,7 @@ class ScoutMiniCAN:
                 "tracking_mode": "stanley",
                 "stanley_gain": float(kwargs.get("stanley_gain", 0.4)),
                 "stanley_softening_speed_mps": float(
-                    kwargs.get("stanley_softening_speed_mps", 0.55)
+                    kwargs.get("stanley_softening_speed_mps", 1.0)
                 ),
                 "stanley_lateral_pd_kp": 0.0,
                 "stanley_lateral_pd_kd": 0.0,
@@ -1178,6 +1185,10 @@ class ScoutMiniCAN:
         tracking_mode = mode
         use_stanley = True
 
+        seg_kind = ""
+        if isinstance(record_context, dict):
+            seg_kind = str(record_context.get("segment_kind") or "").strip().lower()
+
         print(
             f"[ScoutMiniCAN] 路径跟踪开始: {len(waypoints)}个点, 速度={speed_mps}m/s, "
             f"mode={tracking_mode}"
@@ -1193,326 +1204,337 @@ class ScoutMiniCAN:
         exit_reason = "loop_exit"
         completed = False
 
-        while not self._stop_flag.is_set():
-            pose = update_pose()
-            if pose is None:
-                print("[ScoutMiniCAN] PID路径跟踪: 位姿丢失, 主动停车.")
-                exit_reason = "pose_lost"
-                break
-
-            current_x, current_y, current_yaw = pose.x, pose.y, pose.yaw
-            if last_pose is not None:
-                traveled += math.hypot(current_x - last_pose.x, current_y - last_pose.y)
-            last_pose = pose
-
-            # 到终点的距离（用于提前终止与减速）
-            dx_goal = waypoints[-1][0] - current_x
-            dy_goal = waypoints[-1][1] - current_y
-            dist_to_goal = math.hypot(dx_goal, dy_goal)
-            if (not is_loop) and dist_to_goal <= arrival_dist:
-                exit_reason = "goal_arrived"
-                completed = True
-                break
-
-            # 寻找最近路径点和前瞻点
-            search_start = max(0, nearest_hint - backtrack)
-            search_end = min(len(waypoints) - 1, nearest_hint + forward_window)
-            nearest_idx, lookahead_idx = self._find_lookahead_point(
-                current_x, current_y, waypoints, lookahead_distance, search_start, search_end
-            )
-            if nearest_idx > nearest_hint:
-                nearest_hint = nearest_idx
-
-            # 反向倒车时，使用“运动方向”的虚拟航向（yaw+pi）
-            motion_yaw = current_yaw
-            if speed_sign < 0.0:
-                motion_yaw = _wrap_angle(current_yaw + math.pi)
-
-            # 横向误差：用最近路径点计算，保证贴近轨迹
-            nearest_x, nearest_y = waypoints[nearest_idx]
-            lateral_error = self._calculate_lateral_error(
-                current_x, current_y, motion_yaw, nearest_x, nearest_y
-            )
-
-            # 航向误差：优先用前瞻方向，避免末端点重合导致角度抖动
-            dx_heading = waypoints[lookahead_idx][0] - waypoints[nearest_idx][0]
-            dy_heading = waypoints[lookahead_idx][1] - waypoints[nearest_idx][1]
-            if dx_heading * dx_heading + dy_heading * dy_heading < 1e-6:
-                if nearest_idx < len(waypoints) - 1:
-                    dx_heading = waypoints[nearest_idx + 1][0] - waypoints[nearest_idx][0]
-                    dy_heading = waypoints[nearest_idx + 1][1] - waypoints[nearest_idx][1]
-                elif nearest_idx > 0:
-                    dx_heading = waypoints[nearest_idx][0] - waypoints[nearest_idx - 1][0]
-                    dy_heading = waypoints[nearest_idx][1] - waypoints[nearest_idx - 1][1]
-            if dx_heading * dx_heading + dy_heading * dy_heading < 1e-6:
-                target_heading = motion_yaw
-            else:
-                target_heading = math.atan2(dy_heading, dx_heading)
-            heading_error = _wrap_angle(target_heading - motion_yaw)
-
-            stanley_term = 0.0
-            stanley_lateral_pd_out = 0.0
-            stanley_w_pid_out = 0.0
-            if use_stanley:
-                speed_term = max(
-                    0.05,
-                    abs(float(speed_abs)) + abs(float(stanley_softening_speed_mps)),
+        try:
+            while not self._stop_flag.is_set():
+                pose = update_pose()
+                if pose is None:
+                    print("[ScoutMiniCAN] PID路径跟踪: 位姿丢失, 主动停车.")
+                    exit_reason = "pose_lost"
+                    break
+    
+                current_x, current_y, current_yaw = pose.x, pose.y, pose.yaw
+                if last_pose is not None:
+                    traveled += math.hypot(current_x - last_pose.x, current_y - last_pose.y)
+                last_pose = pose
+    
+                # 到终点的距离（用于提前终止与减速）
+                dx_goal = waypoints[-1][0] - current_x
+                dy_goal = waypoints[-1][1] - current_y
+                dist_to_goal = math.hypot(dx_goal, dy_goal)
+                if (not is_loop) and dist_to_goal <= arrival_dist:
+                    exit_reason = "goal_arrived"
+                    completed = True
+                    break
+    
+                # 寻找最近路径点和前瞻点
+                search_start = max(0, nearest_hint - backtrack)
+                search_end = min(len(waypoints) - 1, nearest_hint + forward_window)
+                nearest_idx, lookahead_idx = self._find_lookahead_point(
+                    current_x, current_y, waypoints, lookahead_distance, search_start, search_end
                 )
-                stanley_term = math.atan2(float(stanley_gain) * float(lateral_error), speed_term)
-                stanley_output = _wrap_angle(float(heading_error) + float(stanley_term))
-                try:
-                    dt_eff_stanley_pid = float(dt) if dt and float(dt) > 0 else 0.02
-                except Exception:
-                    dt_eff_stanley_pid = 0.02
-                if abs(float(stanley_lateral_pd_kp)) > 1e-9 or abs(float(stanley_lateral_pd_kd)) > 1e-9:
-                    try:
-                        dt_eff_pd = float(dt) if dt and float(dt) > 0 else 0.02
-                    except Exception:
-                        dt_eff_pd = 0.02
-                    if not hasattr(self, "_stanley_lat_pd_prev_err"):
-                        self._stanley_lat_pd_prev_err = float(lateral_error)
-                    prev_err = float(getattr(self, "_stanley_lat_pd_prev_err"))
-                    derr = (float(lateral_error) - prev_err) / max(1e-6, dt_eff_pd)
-                    self._stanley_lat_pd_prev_err = float(lateral_error)
-                    stanley_lateral_pd_out = float(stanley_lateral_pd_kp) * float(lateral_error) + float(
-                        stanley_lateral_pd_kd
-                    ) * float(derr)
-                    lim = max(0.05, abs(float(stanley_lateral_pd_output_limit_radps)))
-                    stanley_lateral_pd_out = _sat(stanley_lateral_pd_out, -lim, lim)
+                if nearest_idx > nearest_hint:
+                    nearest_hint = nearest_idx
 
-                # 先得到 Stanley 的角速度输出（用于满足横向/航向误差）
-                w_stanley = float(stanley_output) + float(stanley_lateral_pd_out)
-
-                if enable_stanley_w_pid:
-                    # 在横向/航向误差“足够小”时，再对 w_stanley 做 PID 抑制，使 w 趋于 0
-                    # 误差越小，抑制越强；误差较大时不介入，避免削弱转向纠偏能力
-                    lat_thresh_m = 0.20
-                    head_thresh_rad = math.radians(10.0)
-                    lat_ratio = abs(float(lateral_error)) / max(1e-6, lat_thresh_m)
-                    head_ratio = abs(float(heading_error)) / max(1e-6, head_thresh_rad)
-                    scale = 1.0 - max(lat_ratio, head_ratio)
-                    scale = max(0.0, min(1.0, float(scale)))
-                    if scale <= 1e-6:
-                        # 误差大：不做 w->0 抑制，且避免积分累积影响后续转向
-                        try:
-                            self.stanley_w_pid.reset()
-                        except Exception:
-                            pass
-                        stanley_w_pid_out = 0.0
-                    else:
-                        # 让 w 朝 0 收敛：error = 0 - w_stanley
-                        stanley_w_pid_out = float(
-                            self.stanley_w_pid.update(float(-w_stanley), dt=dt_eff_stanley_pid)
-                        ) * float(scale)
+                # Cluster CSV：前进直线段将 DRI 第 2 列 R 写为沿路径到终点的剩余距离（m）
+                idx_nm = min(nearest_idx, len(s_cum) - 1)
+                path_remaining_m = max(0.0, total_len - float(s_cum[idx_nm]))
+                if speed_sign > 0.0 and seg_kind == "line":
+                    set_cluster_csv_straight_path_remaining_m(path_remaining_m)
                 else:
-                    stanley_w_pid_out = 0.0
-
-                angular_speed = float(w_stanley) + float(stanley_w_pid_out)
-                lateral_correction = float(stanley_output)
-                heading_correction = 0.0
-            else:
-                # 理论上不会走到这里：纯 PID 已移除
-                angular_speed = 0.0
-                lateral_correction = 0.0
-                heading_correction = 0.0
-            angular_speed = _sat(angular_speed, -self.MAX_ANGULAR_RADPS, self.MAX_ANGULAR_RADPS)
-
-            # 自适应速度控制：根据曲率和误差调整速度
-            curvature = abs(angular_speed) / max(speed_abs, 0.1)
-            speed_factor = 1.0 / (1.0 + 2.0 * curvature + 3.0 * abs(lateral_error))
-            speed_scale = max(0.3, speed_factor)
-            # 速度剖面：若提供 (s[m], speed_abs[m/s]) 列表，则在路径弧长上做线性插值替换标称速度
-            if speed_profile:
-                s_now = float(s_cum[min(nearest_idx, len(s_cum) - 1)])
-                sp = sorted(
-                    ((float(s), abs(float(v))) for s, v in speed_profile),
-                    key=lambda x: x[0],
+                    set_cluster_csv_straight_path_remaining_m(None)
+    
+                # 反向倒车时，使用“运动方向”的虚拟航向（yaw+pi）
+                motion_yaw = current_yaw
+                if speed_sign < 0.0:
+                    motion_yaw = _wrap_angle(current_yaw + math.pi)
+    
+                # 横向误差：用最近路径点计算，保证贴近轨迹
+                nearest_x, nearest_y = waypoints[nearest_idx]
+                lateral_error = self._calculate_lateral_error(
+                    current_x, current_y, motion_yaw, nearest_x, nearest_y
                 )
-                if sp:
-                    if s_now <= sp[0][0]:
-                        speed_abs_profile = sp[0][1]
-                    elif s_now >= sp[-1][0]:
-                        speed_abs_profile = sp[-1][1]
-                    else:
-                        speed_abs_profile = speed_abs
-                        for (s0, v0), (s1, v1) in zip(sp, sp[1:]):
-                            if s0 <= s_now <= s1 and s1 > s0 + 1e-9:
-                                t = (s_now - s0) / (s1 - s0)
-                                speed_abs_profile = (1.0 - t) * v0 + t * v1
-                                break
-                    speed_abs = max(0.0, float(speed_abs_profile))
-            if slow_down_dist is not None and slow_down_dist > 0.0:
-                if dist_to_goal < slow_down_dist:
-                    speed_scale *= max(0.15, dist_to_goal / slow_down_dist)
-            adjusted_speed = speed_sign * speed_abs * speed_scale
-
-            # 速度/角速度平滑与限幅，减少圆弧抖动
-            if dt is None or dt <= 0:
-                dt_eff = 0.02
-            else:
-                dt_eff = float(dt)
-
-            desired_v = adjusted_speed
-            desired_w = angular_speed
-
-            # 角速度稳态偏置（低通）+ 高频抑制
-            if w_bias is None:
-                w_bias = desired_w
-            else:
-                beta = dt_eff / (w_bias_tau + dt_eff)
-                w_bias = (1.0 - beta) * w_bias + beta * desired_w
-            desired_w = w_bias + (desired_w - w_bias) * w_bias_hf_gain
-
-            if prev_cmd_v is None:
-                cmd_v = desired_v
-                cmd_w = desired_w
-            else:
-                dv_max = max_v_rate * dt_eff
-                dw_max = max_w_rate * dt_eff
-                if max_w_step is not None:
+    
+                # 航向误差：优先用前瞻方向，避免末端点重合导致角度抖动
+                dx_heading = waypoints[lookahead_idx][0] - waypoints[nearest_idx][0]
+                dy_heading = waypoints[lookahead_idx][1] - waypoints[nearest_idx][1]
+                if dx_heading * dx_heading + dy_heading * dy_heading < 1e-6:
+                    if nearest_idx < len(waypoints) - 1:
+                        dx_heading = waypoints[nearest_idx + 1][0] - waypoints[nearest_idx][0]
+                        dy_heading = waypoints[nearest_idx + 1][1] - waypoints[nearest_idx][1]
+                    elif nearest_idx > 0:
+                        dx_heading = waypoints[nearest_idx][0] - waypoints[nearest_idx - 1][0]
+                        dy_heading = waypoints[nearest_idx][1] - waypoints[nearest_idx - 1][1]
+                if dx_heading * dx_heading + dy_heading * dy_heading < 1e-6:
+                    target_heading = motion_yaw
+                else:
+                    target_heading = math.atan2(dy_heading, dx_heading)
+                heading_error = _wrap_angle(target_heading - motion_yaw)
+    
+                stanley_term = 0.0
+                stanley_lateral_pd_out = 0.0
+                stanley_w_pid_out = 0.0
+                if use_stanley:
+                    speed_term = max(
+                        0.05,
+                        abs(float(speed_abs)) + abs(float(stanley_softening_speed_mps)),
+                    )
+                    stanley_term = math.atan2(float(stanley_gain) * float(lateral_error), speed_term)
+                    stanley_output = _wrap_angle(float(heading_error) + float(stanley_term))
                     try:
-                        dw_max = min(dw_max, abs(float(max_w_step)))
-                    except (TypeError, ValueError):
-                        pass
-                dv = desired_v - prev_cmd_v
-                dw = desired_w - prev_cmd_w
-                if abs(dv) > dv_max:
-                    desired_v = prev_cmd_v + math.copysign(dv_max, dv)
-                if abs(dw) > dw_max:
-                    desired_w = prev_cmd_w + math.copysign(dw_max, dw)
-
-                # 高曲率段采用更强的低通平滑
-                curvature_now = abs(desired_w) / max(abs(desired_v), 0.1)
-                alpha = alpha_curve if curvature_now > 0.6 else alpha_base
-                cmd_v = alpha * desired_v + (1.0 - alpha) * prev_cmd_v
-                cmd_w = alpha * desired_w + (1.0 - alpha) * prev_cmd_w
-
-            prev_cmd_v = cmd_v
-            prev_cmd_w = cmd_w
-
-            self._send_motion_command(cmd_v, cmd_w)
-            if callable(sample_callback):
-                try:
-                    now_ts = time.time()
-                    fb_v = 0.0
-                    fb_w = 0.0
-                    try:
-                        st = self.get_status()
-                        fb_v = float(getattr(st, "linear_speed", 0.0) or 0.0)
-                        fb_w = float(getattr(st, "angular_speed", 0.0) or 0.0)
+                        dt_eff_stanley_pid = float(dt) if dt and float(dt) > 0 else 0.02
                     except Exception:
+                        dt_eff_stanley_pid = 0.02
+                    if abs(float(stanley_lateral_pd_kp)) > 1e-9 or abs(float(stanley_lateral_pd_kd)) > 1e-9:
+                        try:
+                            dt_eff_pd = float(dt) if dt and float(dt) > 0 else 0.02
+                        except Exception:
+                            dt_eff_pd = 0.02
+                        if not hasattr(self, "_stanley_lat_pd_prev_err"):
+                            self._stanley_lat_pd_prev_err = float(lateral_error)
+                        prev_err = float(getattr(self, "_stanley_lat_pd_prev_err"))
+                        derr = (float(lateral_error) - prev_err) / max(1e-6, dt_eff_pd)
+                        self._stanley_lat_pd_prev_err = float(lateral_error)
+                        stanley_lateral_pd_out = float(stanley_lateral_pd_kp) * float(lateral_error) + float(
+                            stanley_lateral_pd_kd
+                        ) * float(derr)
+                        lim = max(0.05, abs(float(stanley_lateral_pd_output_limit_radps)))
+                        stanley_lateral_pd_out = _sat(stanley_lateral_pd_out, -lim, lim)
+    
+                    # 先得到 Stanley 的角速度输出（用于满足横向/航向误差）
+                    w_stanley = float(stanley_output) + float(stanley_lateral_pd_out)
+    
+                    if enable_stanley_w_pid:
+                        # 在横向/航向误差“足够小”时，再对 w_stanley 做 PID 抑制，使 w 趋于 0
+                        # 误差越小，抑制越强；误差较大时不介入，避免削弱转向纠偏能力
+                        lat_thresh_m = 0.20
+                        head_thresh_rad = math.radians(10.0)
+                        lat_ratio = abs(float(lateral_error)) / max(1e-6, lat_thresh_m)
+                        head_ratio = abs(float(heading_error)) / max(1e-6, head_thresh_rad)
+                        scale = 1.0 - max(lat_ratio, head_ratio)
+                        scale = max(0.0, min(1.0, float(scale)))
+                        if scale <= 1e-6:
+                            # 误差大：不做 w->0 抑制，且避免积分累积影响后续转向
+                            try:
+                                self.stanley_w_pid.reset()
+                            except Exception:
+                                pass
+                            stanley_w_pid_out = 0.0
+                        else:
+                            # 让 w 朝 0 收敛：error = 0 - w_stanley
+                            stanley_w_pid_out = float(
+                                self.stanley_w_pid.update(float(-w_stanley), dt=dt_eff_stanley_pid)
+                            ) * float(scale)
+                    else:
+                        stanley_w_pid_out = 0.0
+    
+                    angular_speed = float(w_stanley) + float(stanley_w_pid_out)
+                    lateral_correction = float(stanley_output)
+                    heading_correction = 0.0
+                else:
+                    # 理论上不会走到这里：纯 PID 已移除
+                    angular_speed = 0.0
+                    lateral_correction = 0.0
+                    heading_correction = 0.0
+                angular_speed = _sat(angular_speed, -self.MAX_ANGULAR_RADPS, self.MAX_ANGULAR_RADPS)
+    
+                # 自适应速度控制：根据曲率和误差调整速度
+                curvature = abs(angular_speed) / max(speed_abs, 0.1)
+                speed_factor = 1.0 / (1.0 + 2.0 * curvature + 3.0 * abs(lateral_error))
+                speed_scale = max(0.3, speed_factor)
+                # 速度剖面：若提供 (s[m], speed_abs[m/s]) 列表，则在路径弧长上做线性插值替换标称速度
+                if speed_profile:
+                    s_now = float(s_cum[min(nearest_idx, len(s_cum) - 1)])
+                    sp = sorted(
+                        ((float(s), abs(float(v))) for s, v in speed_profile),
+                        key=lambda x: x[0],
+                    )
+                    if sp:
+                        if s_now <= sp[0][0]:
+                            speed_abs_profile = sp[0][1]
+                        elif s_now >= sp[-1][0]:
+                            speed_abs_profile = sp[-1][1]
+                        else:
+                            speed_abs_profile = speed_abs
+                            for (s0, v0), (s1, v1) in zip(sp, sp[1:]):
+                                if s0 <= s_now <= s1 and s1 > s0 + 1e-9:
+                                    t = (s_now - s0) / (s1 - s0)
+                                    speed_abs_profile = (1.0 - t) * v0 + t * v1
+                                    break
+                        speed_abs = max(0.0, float(speed_abs_profile))
+                if slow_down_dist is not None and slow_down_dist > 0.0:
+                    if dist_to_goal < slow_down_dist:
+                        speed_scale *= max(0.15, dist_to_goal / slow_down_dist)
+                adjusted_speed = speed_sign * speed_abs * speed_scale
+    
+                # 速度/角速度平滑与限幅，减少圆弧抖动
+                if dt is None or dt <= 0:
+                    dt_eff = 0.02
+                else:
+                    dt_eff = float(dt)
+    
+                desired_v = adjusted_speed
+                desired_w = angular_speed
+    
+                # 角速度稳态偏置（低通）+ 高频抑制
+                if w_bias is None:
+                    w_bias = desired_w
+                else:
+                    beta = dt_eff / (w_bias_tau + dt_eff)
+                    w_bias = (1.0 - beta) * w_bias + beta * desired_w
+                desired_w = w_bias + (desired_w - w_bias) * w_bias_hf_gain
+    
+                if prev_cmd_v is None:
+                    cmd_v = desired_v
+                    cmd_w = desired_w
+                else:
+                    dv_max = max_v_rate * dt_eff
+                    dw_max = max_w_rate * dt_eff
+                    if max_w_step is not None:
+                        try:
+                            dw_max = min(dw_max, abs(float(max_w_step)))
+                        except (TypeError, ValueError):
+                            pass
+                    dv = desired_v - prev_cmd_v
+                    dw = desired_w - prev_cmd_w
+                    if abs(dv) > dv_max:
+                        desired_v = prev_cmd_v + math.copysign(dv_max, dv)
+                    if abs(dw) > dw_max:
+                        desired_w = prev_cmd_w + math.copysign(dw_max, dw)
+    
+                    # 高曲率段采用更强的低通平滑
+                    curvature_now = abs(desired_w) / max(abs(desired_v), 0.1)
+                    alpha = alpha_curve if curvature_now > 0.6 else alpha_base
+                    cmd_v = alpha * desired_v + (1.0 - alpha) * prev_cmd_v
+                    cmd_w = alpha * desired_w + (1.0 - alpha) * prev_cmd_w
+    
+                prev_cmd_v = cmd_v
+                prev_cmd_w = cmd_w
+    
+                self._send_motion_command(cmd_v, cmd_w)
+                if callable(sample_callback):
+                    try:
+                        now_ts = time.time()
                         fb_v = 0.0
                         fb_w = 0.0
-                    curvature_inv_m = abs(float(cmd_w)) / max(abs(float(cmd_v)), 0.1)
-                    payload: Dict[str, Any] = {
-                        "timestamp": float(now_ts),
-                        "relative_time_s": float(max(0.0, now_ts - started_wall_ts)),
-                        "run_key": str(run_key),
-                        "run_label": str(run_label or ""),
-                        "tracking_mode": str(tracking_mode or "pid"),
-                        "speed_sign": float(speed_sign),
-                        "speed_mps": float(speed_mps),
-                        "nominal_speed_abs_mps": float(speed_abs),
-                        "lookahead_base_m": float(lookahead_distance),
-                        "arrival_dist_m": float(arrival_dist),
-                        "slow_down_dist_m": float(slow_down_dist or 0.0),
-                        "stanley_gain": float(stanley_gain),
-                        # UI 字段名沿用历史：softening_distance_m（本实现为速度软化项，数值仍可用于对比）
-                        "stanley_softening_distance_m": float(stanley_softening_speed_mps),
-                        "stanley_term_rad": float(stanley_term),
-                        "stanley_w_pid_output_radps": float(stanley_w_pid_out),
-                        "lateral_pid_kp": 0.0,
-                        "lateral_pid_ki": 0.0,
-                        "lateral_pid_kd": 0.0,
-                        "heading_pid_kp": 0.0,
-                        "heading_pid_ki": 0.0,
-                        "heading_pid_kd": 0.0,
-                        "yaw_rate_pid_kp": float(getattr(self.stanley_w_pid, "kp", 0.0) or 0.0)
-                        if enable_stanley_w_pid
-                        else 0.0,
-                        "yaw_rate_pid_ki": float(getattr(self.stanley_w_pid, "ki", 0.0) or 0.0)
-                        if enable_stanley_w_pid
-                        else 0.0,
-                        "yaw_rate_pid_kd": float(getattr(self.stanley_w_pid, "kd", 0.0) or 0.0)
-                        if enable_stanley_w_pid
-                        else 0.0,
-                        "cmd_v_mps": float(cmd_v),
-                        "cmd_w_radps": float(cmd_w),
-                        "desired_v_mps": float(desired_v),
-                        "desired_w_radps": float(desired_w),
-                        "lateral_error_m": float(lateral_error),
-                        "stanley_lateral_pd_output_radps": float(stanley_lateral_pd_out),
-                        "heading_error_rad": float(heading_error),
-                        "yaw_rate_error_radps": 0.0,
-                        "feedback_v_mps": float(fb_v),
-                        "feedback_w_radps": float(fb_w),
-                        "yaw_rate_feedback_valid": 0,
-                        "pose_age_s": 0.0,
-                        "current_x_m": float(current_x),
-                        "current_y_m": float(current_y),
-                        "nearest_x_m": float(nearest_x),
-                        "nearest_y_m": float(nearest_y),
-                        "lookahead_x_m": float(waypoints[lookahead_idx][0]),
-                        "lookahead_y_m": float(waypoints[lookahead_idx][1]),
-                        "dist_to_goal_m": float(dist_to_goal),
-                        "path_s_m": float(s_cum[min(nearest_idx, len(s_cum) - 1)]),
-                        "motion_distance_m": float(traveled),
-                        "motion_distance_signed_m": float(speed_sign * traveled),
-                        "motion_distance_total_m": float(traveled),
-                        "motion_distance_total_signed_m": float(speed_sign * traveled),
-                        "lateral_pid_output_radps": float(lateral_correction),
-                        "heading_pid_output_radps": float(heading_correction),
-                        "yaw_rate_pid_output_radps": 0.0,
-                        "path_curvature_inv_m": float(curvature_inv_m),
-                        "path_ff_w_radps": 0.0,
-                        "profile_speed_mps": float(speed_abs),
-                    }
-                    if isinstance(record_context, dict) and record_context:
-                        payload.update({str(k): v for k, v in record_context.items()})
-                    sample_callback(payload)
+                        try:
+                            st = self.get_status()
+                            fb_v = float(getattr(st, "linear_speed", 0.0) or 0.0)
+                            fb_w = float(getattr(st, "angular_speed", 0.0) or 0.0)
+                        except Exception:
+                            fb_v = 0.0
+                            fb_w = 0.0
+                        curvature_inv_m = abs(float(cmd_w)) / max(abs(float(cmd_v)), 0.1)
+                        payload: Dict[str, Any] = {
+                            "timestamp": float(now_ts),
+                            "relative_time_s": float(max(0.0, now_ts - started_wall_ts)),
+                            "run_key": str(run_key),
+                            "run_label": str(run_label or ""),
+                            "tracking_mode": str(tracking_mode or "pid"),
+                            "speed_sign": float(speed_sign),
+                            "speed_mps": float(speed_mps),
+                            "nominal_speed_abs_mps": float(speed_abs),
+                            "lookahead_base_m": float(lookahead_distance),
+                            "arrival_dist_m": float(arrival_dist),
+                            "slow_down_dist_m": float(slow_down_dist or 0.0),
+                            "stanley_gain": float(stanley_gain),
+                            # UI 字段名沿用历史：softening_distance_m（本实现为速度软化项，数值仍可用于对比）
+                            "stanley_softening_distance_m": float(stanley_softening_speed_mps),
+                            "stanley_term_rad": float(stanley_term),
+                            "stanley_w_pid_output_radps": float(stanley_w_pid_out),
+                            "lateral_pid_kp": 0.0,
+                            "lateral_pid_ki": 0.0,
+                            "lateral_pid_kd": 0.0,
+                            "heading_pid_kp": 0.0,
+                            "heading_pid_ki": 0.0,
+                            "heading_pid_kd": 0.0,
+                            "yaw_rate_pid_kp": float(getattr(self.stanley_w_pid, "kp", 0.0) or 0.0)
+                            if enable_stanley_w_pid
+                            else 0.0,
+                            "yaw_rate_pid_ki": float(getattr(self.stanley_w_pid, "ki", 0.0) or 0.0)
+                            if enable_stanley_w_pid
+                            else 0.0,
+                            "yaw_rate_pid_kd": float(getattr(self.stanley_w_pid, "kd", 0.0) or 0.0)
+                            if enable_stanley_w_pid
+                            else 0.0,
+                            "cmd_v_mps": float(cmd_v),
+                            "cmd_w_radps": float(cmd_w),
+                            "desired_v_mps": float(desired_v),
+                            "desired_w_radps": float(desired_w),
+                            "lateral_error_m": float(lateral_error),
+                            "stanley_lateral_pd_output_radps": float(stanley_lateral_pd_out),
+                            "heading_error_rad": float(heading_error),
+                            "yaw_rate_error_radps": 0.0,
+                            "feedback_v_mps": float(fb_v),
+                            "feedback_w_radps": float(fb_w),
+                            "yaw_rate_feedback_valid": 0,
+                            "pose_age_s": 0.0,
+                            "current_x_m": float(current_x),
+                            "current_y_m": float(current_y),
+                            "nearest_x_m": float(nearest_x),
+                            "nearest_y_m": float(nearest_y),
+                            "lookahead_x_m": float(waypoints[lookahead_idx][0]),
+                            "lookahead_y_m": float(waypoints[lookahead_idx][1]),
+                            "dist_to_goal_m": float(dist_to_goal),
+                            "path_s_m": float(s_cum[min(nearest_idx, len(s_cum) - 1)]),
+                            "motion_distance_m": float(traveled),
+                            "motion_distance_signed_m": float(speed_sign * traveled),
+                            "motion_distance_total_m": float(traveled),
+                            "motion_distance_total_signed_m": float(speed_sign * traveled),
+                            "lateral_pid_output_radps": float(lateral_correction),
+                            "heading_pid_output_radps": float(heading_correction),
+                            "yaw_rate_pid_output_radps": 0.0,
+                            "path_curvature_inv_m": float(curvature_inv_m),
+                            "path_ff_w_radps": 0.0,
+                            "profile_speed_mps": float(speed_abs),
+                        }
+                        if isinstance(record_context, dict) and record_context:
+                            payload.update({str(k): v for k, v in record_context.items()})
+                        sample_callback(payload)
+                    except Exception:
+                        pass
+    
+                sample_count += 1
+                peak_abs_lateral_error = max(peak_abs_lateral_error, abs(float(lateral_error)))
+                peak_abs_heading_error = max(peak_abs_heading_error, abs(math.degrees(float(heading_error))))
+                peak_abs_cmd_w = max(peak_abs_cmd_w, abs(float(cmd_w)))
+                peak_abs_yaw_rate_err = max(peak_abs_yaw_rate_err, abs(0.0))
+                try:
+                    fb_w = float(getattr(self.get_status(), "angular_speed", 0.0) or 0.0)
                 except Exception:
-                    pass
-
-            sample_count += 1
-            peak_abs_lateral_error = max(peak_abs_lateral_error, abs(float(lateral_error)))
-            peak_abs_heading_error = max(peak_abs_heading_error, abs(math.degrees(float(heading_error))))
-            peak_abs_cmd_w = max(peak_abs_cmd_w, abs(float(cmd_w)))
-            peak_abs_yaw_rate_err = max(peak_abs_yaw_rate_err, abs(0.0))
-            try:
-                fb_w = float(getattr(self.get_status(), "angular_speed", 0.0) or 0.0)
-            except Exception:
-                fb_w = 0.0
-            peak_abs_fb_w = max(peak_abs_fb_w, abs(fb_w))
-
-            # 检查是否到达终点
-            remaining_len = max(0.0, total_len - s_cum[min(nearest_idx, len(s_cum) - 1)])
-            if remaining_len <= arrival_dist:
-                if dist_to_goal <= arrival_dist:
+                    fb_w = 0.0
+                peak_abs_fb_w = max(peak_abs_fb_w, abs(fb_w))
+    
+                # 检查是否到达终点
+                remaining_len = max(0.0, total_len - s_cum[min(nearest_idx, len(s_cum) - 1)])
+                if remaining_len <= arrival_dist:
+                    if dist_to_goal <= arrival_dist:
+                        if (not is_loop) or (traveled >= loop_finish_min):
+                            exit_reason = "goal_arrived"
+                            completed = True
+                            break
+                    if (not is_loop) and abs(lateral_error) <= near_goal_deadband:
+                        exit_reason = "goal_arrived"
+                        completed = True
+                        break
+                if traveled >= total_len and dist_to_goal <= arrival_dist:
                     if (not is_loop) or (traveled >= loop_finish_min):
                         exit_reason = "goal_arrived"
                         completed = True
                         break
-                if (not is_loop) and abs(lateral_error) <= near_goal_deadband:
-                    exit_reason = "goal_arrived"
-                    completed = True
-                    break
-            if traveled >= total_len and dist_to_goal <= arrival_dist:
-                if (not is_loop) or (traveled >= loop_finish_min):
-                    exit_reason = "goal_arrived"
-                    completed = True
-                    break
-            if not is_loop:
-                if dist_to_goal <= near_goal_deadband:
-                    if near_goal_since is None:
-                        near_goal_since = time.time()
-                    elif time.time() - near_goal_since >= near_goal_hold_s:
-                        exit_reason = "goal_arrived"
-                        completed = True
-                        break
-                else:
-                    near_goal_since = None
-
-            time.sleep(dt)
+                if not is_loop:
+                    if dist_to_goal <= near_goal_deadband:
+                        if near_goal_since is None:
+                            near_goal_since = time.time()
+                        elif time.time() - near_goal_since >= near_goal_hold_s:
+                            exit_reason = "goal_arrived"
+                            completed = True
+                            break
+                    else:
+                        near_goal_since = None
+    
+                time.sleep(dt)
+        finally:
+            set_cluster_csv_straight_path_remaining_m(None)
 
         self._send_motion_command(0.0, 0.0)
         if self._stop_flag.is_set() and exit_reason == "loop_exit":

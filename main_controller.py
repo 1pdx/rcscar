@@ -201,6 +201,9 @@ class MainController:
         stem: str,
         run_number: int = 1,
         calibration: Optional[Any] = None,
+        *,
+        orbit_roi: bool = False,
+        filename: Optional[str] = None,
     ) -> bool:
         """开始一段 Cluster RCS CSV 写入（与 ars40x_cluster_logger / DRI Raw 元数据格式一致）。"""
         if self.cluster_csv_runtime is None:
@@ -211,6 +214,8 @@ class MainController:
                 run_number=run_number,
                 stem=stem,
                 calibration=calibration,
+                orbit_roi=orbit_roi,
+                filename=filename,
             )
             return True
         except Exception as e:

@@ -74,7 +74,7 @@ def _limits_pedistrain():
         "x": t,
         "lower": np.array(y11),
         "upper": np.array(y12),
-        "xlim": (0.0, 50.0),
+        "xlim": (0.0, 60.0),
         "ylim": (-25.0, 20.0),
     }
 
@@ -106,7 +106,7 @@ def _limits_car():
         "x": t,
         "lower": np.array(y11),
         "upper": np.array(y12),
-        "xlim": (0.0, 50.0),
+        "xlim": (0.0, 60.0),
         "ylim": (-5.0, 30.0),
     }
 
@@ -132,7 +132,7 @@ def _limits_evt_balloon_car():
         "x": t,
         "lower": lower.astype(float),
         "upper": upper.astype(float),
-        "xlim": (0.0, 50.0),
+        "xlim": (0.0, 60.0),
         "ylim": (ylim_min, ylim_max),
     }
 
@@ -192,7 +192,7 @@ def _limits_bicycle(angle: str):
         "x": t,
         "lower": np.array(y11),
         "upper": np.array(y12),
-        "xlim": (0.0, 50.0),
+        "xlim": (0.0, 60.0),
         "ylim": ylim,
     }
 

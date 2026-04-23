@@ -1,7 +1,9 @@
  # main_ui.py
 # -*- coding: utf-8 -*-
 import csv
+import hashlib
 import importlib.util
+import os
 import platform
 import re
 import shutil
@@ -13,9 +15,13 @@ import urllib.request
 from dataclasses import dataclass, replace
 from pathlib import Path
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-from ars40x_cluster_logger import build_columns, format_cluster_csv_calibration
+from ars40x_cluster_logger import (
+    MAX_CLUSTERS,
+    build_columns,
+    format_cluster_csv_calibration,
+)
 
 import numpy as np
 from PyQt5 import QtCore, QtWidgets, QtGui
@@ -309,8 +315,25 @@ combine_rcs_db_incoherent_sum = getattr(
     _radar_mod, "combine_rcs_db_incoherent_sum", None
 )
 RCS_POINT_RCS_EMA_ALPHA = float(getattr(_radar_mod, "RCS_POINT_RCS_EMA_ALPHA", 0.35))
+RCS_BIN_INCOHERENT_SUM_MAX_TIME_SPAN_S = float(
+    getattr(_radar_mod, "RCS_BIN_INCOHERENT_SUM_MAX_TIME_SPAN_S", 0.08)
+)
 # 与 fit_curve 一致：分箱后沿距离对 RCS 做 SG（无 scipy 时模块内回退中值+滑动平均）
 _peak_smooth_rcs_series = getattr(_radar_mod, "_peak_smooth_rcs_series", None)
+
+# Cluster CSV 解析（对齐 DRI Raw）：Time 归一为段内相对秒；剔除首目标平面位置突变（如 DX 跳变）
+try:
+    CLUSTER_RCS_PARSE_MAX_DIST_STEP_M = float(
+        os.getenv("CLUSTER_RCS_PARSE_MAX_DIST_STEP_M", "5.0")
+    )
+except ValueError:
+    CLUSTER_RCS_PARSE_MAX_DIST_STEP_M = 5.0
+try:
+    CLUSTER_RCS_PARSE_TIME_GAP_RESET_S = float(
+        os.getenv("CLUSTER_RCS_PARSE_TIME_GAP_RESET_S", "0.35")
+    )
+except ValueError:
+    CLUSTER_RCS_PARSE_TIME_GAP_RESET_S = 0.35
 
 
 def _load_rcs_reference_module():
@@ -364,6 +387,9 @@ except Exception as _rcs_ref_err:
 PRESET_PATHS_CSV = Path(__file__).with_name("preset_paths.csv")
 SegmentRange = Tuple[int, int, int, bool, float, float, float]
 DEFAULT_SEGMENT_SPEED_MPS = 0.5
+DEFAULT_RADIAL_MEASUREMENT_SPEED_MPS = 0.7
+DEFAULT_LINE_PLAN_DIST_M = 50.0
+DEFAULT_LINE_PLAN_SPEED_MPS = 0.7
 DEFAULT_ACCEL_DIST_M = 1.5
 DEFAULT_DECEL_DIST_M = 1.5
 MIN_SEGMENT_SPEED_MPS = 0.08
@@ -387,13 +413,14 @@ STRAIGHT_SEGMENT_POINT_COUNT = 2
 RCS_MAX_DISTANCE_M = 60.0
 # 直线距离-RCS：绘图与拟合有效距离门（与 Radar Signal Processing 中 RCS_FILTER_X_* 一致）
 RCS_STRAIGHT_X_MIN_M = 4.0
-RCS_STRAIGHT_X_MAX_M = 50.0
+RCS_STRAIGHT_X_MAX_M = 60.0
 RCS_STRAIGHT_EMA_ALPHA = 0.5  # 0~1，越小越平滑（建议 0.2~0.35）
 RCS_FIT_GRID_STEP_M = 0.1
 RCS_FIT_LINE_WIDTH = 1.8
 RCS_EXPORT_DPI = 320
 RADAR_TARGET_CHECK_TITLE = (
-    "雷达 Cluster 检查图（0x701，ROI 内：前方 4–50m，左右 ±2m）"
+    "雷达 Cluster 检查图（0x701）：直线默认 前方 4–60m、左右 ±3m；"
+    "圆周 RCS 采集进行中为 ±10m"
 )
 ACTION_CLEAR_LOG_TEXT = "清空日志"
 ACTION_SAVE_LOG_TEXT = "保存日志"
@@ -435,10 +462,17 @@ class _ClusterSafetyProxy:
         self.y = float(c["DY"])
 
 
-# 圆周段 RCS：以前方约 40 m 处目标为采样对象，极坐标径向为真实 RCS(dBsm)
+# 圆周段 RCS：以前方约 40 m 处目标为采样对象；落盘仅 Cluster Raw CSV，极坐标图为离线/预览用
 ORBIT_RCS_NOMINAL_FORWARD_M = 40.0
+# 已锁定且已有采样点后：|DX−40|≤FORWARD_GATE_M 才写入/关联
 ORBIT_RCS_FORWARD_GATE_M = 8.0
-ORBIT_RCS_FILE_MAGIC = "# orbit_rcs v1"
+# 圆周采集尚未写入任何点时：用更宽半宽便于首个目标进门（见 _orbit_rcs_effective_forward_gate_m）
+ORBIT_RCS_FORWARD_GATE_RELAXED_M = 16.0
+# 圆周 RCS 极坐标图：径向网格每格固定 5 dBsm；相邻时间点跳变达到该阈值视为异常点剔除
+ORBIT_RCS_RADIAL_TICK_STEP_DB = 5.0
+ORBIT_RCS_ADJACENT_JUMP_REJECT_DB = 15.0
+# 圆周 RCS：时间平铺到 2π 后按角度分箱，箱内 RCS 取算术平均后连成拟合曲线
+ORBIT_RCS_ANGLE_BIN_DEG = 1.0
 # 同一帧内相距不大于该值的簇合并为同一目标散点（与相同 Cluster_ID 合并一致采用）
 RCS_DISPLAY_TARGET_MERGE_RADIUS_M = 2.5
 FORWARD_STRAIGHT_RCS_TARGET_NAME = "前进直线段"
@@ -662,11 +696,11 @@ class TrajectoryPlannerDialog(QtWidgets.QDialog):
     def __init__(
         self,
         parent: Optional[QtWidgets.QWidget] = None,
-        default_dist: float = 2.0,
+        default_dist: float = DEFAULT_LINE_PLAN_DIST_M,
         default_radius: float = 40.0,
         default_angle: float = 360.0,
         default_circle_direction: str = "ccw",
-        default_line_speed: float = DEFAULT_SEGMENT_SPEED_MPS,
+        default_line_speed: float = DEFAULT_LINE_PLAN_SPEED_MPS,
         default_circle_speed: float = DEFAULT_SEGMENT_SPEED_MPS,
         default_accel_dist: float = DEFAULT_ACCEL_DIST_M,
         default_decel_dist: float = DEFAULT_DECEL_DIST_M,
@@ -783,9 +817,6 @@ class TrajectoryPlannerDialog(QtWidgets.QDialog):
         self.circle_dir.addItems(["逆时针", "顺时针"])
         self.circle_dir.setCurrentIndex(1 if str(default_circle_direction).strip().lower() == "cw" else 0)
         self.circle_rcs_start = QtWidgets.QCheckBox("本段触发采集RCS（Cluster）")
-        self.circle_rcs_start.setToolTip(
-            "Cluster 模式且仅前进直线段落盘：圆弧段运动不会写入 Cluster RCS CSV（请用直线段勾选）。"
-        )
         self.btn_add_circle = QtWidgets.QPushButton("添加圆弧段")
         self.btn_add_circle.clicked.connect(self._add_circle_segment)
         circle_form.addRow("半径", self.circle_radius)
@@ -908,7 +939,8 @@ class TrajectoryPlannerDialog(QtWidgets.QDialog):
 
 
 class RadialMeasurementDialog(QtWidgets.QDialog):
-    _ANGLE_OPTIONS = [0, 45, 90, 135, 180, 225, 270, 315]
+    # 0°, 30°, …, 330°（每隔 30° 一个方向）
+    _ANGLE_OPTIONS = list(range(0, 360, 30))
 
     def __init__(
         self,
@@ -916,14 +948,14 @@ class RadialMeasurementDialog(QtWidgets.QDialog):
         default_angle_cycles: Optional[Dict[int, int]] = None,
         default_inner_radius: float = 4.0,
         default_line_length_m: float = 50.0,
-        default_speed: float = DEFAULT_SEGMENT_SPEED_MPS,
+        default_speed: float = DEFAULT_RADIAL_MEASUREMENT_SPEED_MPS,
         default_accel_dist: float = DEFAULT_ACCEL_DIST_M,
         default_decel_dist: float = DEFAULT_DECEL_DIST_M,
         parent: Optional[QtWidgets.QWidget] = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("星型测量")
-        self.setMinimumWidth(620)
+        self.setMinimumWidth(680)
 
         defaults = {
             int(angle) % 360: max(1, int(count))
@@ -941,8 +973,8 @@ class RadialMeasurementDialog(QtWidgets.QDialog):
         layout.setSpacing(10)
 
         intro = QtWidgets.QLabel(
-            "围绕已标定目标物生成每隔45°的一组直线测量轨迹。"
-            "0° 以轨迹原点指向目标物的方向为基准（右侧为正45°），每个角度都可以单独设置往返测量次数。"
+            "围绕已标定目标物生成每隔30°的一组直线测量轨迹。"
+            "0° 以轨迹原点指向目标物的方向为基准（右侧为正30°），每个角度都可以单独设置往返测量次数。"
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
@@ -975,8 +1007,8 @@ class RadialMeasurementDialog(QtWidgets.QDialog):
             checkbox.toggled.connect(spin.setEnabled)
             self._angle_checks[angle] = checkbox
             self._angle_cycle_spins[angle] = spin
-            row = 1 + (index % 4)
-            col_base = 0 if index < 4 else 3
+            row = 1 + (index % 6)
+            col_base = 0 if index < 6 else 3
             angle_label = QtWidgets.QLabel(f"{angle}°")
             angle_grid.addWidget(checkbox, row, col_base + 0)
             angle_grid.addWidget(angle_label, row, col_base + 1)
@@ -1244,6 +1276,7 @@ class RcsPlotConfigDialog(QtWidgets.QDialog):
         reference_summary: str,
         default_custom_name: Optional[str] = None,
         default_calibration_db: float = 0.0,
+        enable_curve_csv_export: bool = True,
         parent: Optional[QtWidgets.QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -1280,6 +1313,16 @@ class RcsPlotConfigDialog(QtWidgets.QDialog):
         form.addRow("RCS标定值", self.calibration_spin)
         layout.addLayout(form)
 
+        self.export_curve_csv_check = QtWidgets.QCheckBox(
+            "同时生成 _Filtered.csv 和 *_combined.csv"
+        )
+        self.export_curve_csv_check.setToolTip(
+            "仅用于距离-RCS Cluster Raw：按每帧 R 最近的两个簇生成 X/RCS 分箱 Filtered，再输出最终曲线 CSV。"
+        )
+        self.export_curve_csv_check.setChecked(bool(enable_curve_csv_export))
+        self.export_curve_csv_check.setVisible(bool(enable_curve_csv_export))
+        layout.addWidget(self.export_curve_csv_check)
+
         btns = QtWidgets.QHBoxLayout()
         btn_ok = QtWidgets.QPushButton("开始绘图")
         btn_cancel = QtWidgets.QPushButton("取消")
@@ -1290,9 +1333,18 @@ class RcsPlotConfigDialog(QtWidgets.QDialog):
         btns.addWidget(btn_cancel)
         layout.addLayout(btns)
 
-    def values(self) -> Tuple[Optional[str], float]:
+    def values(self) -> Tuple[Optional[str], float, bool]:
         custom_name = str(self.custom_name_edit.text() or "").strip()
-        return (custom_name or None, float(self.calibration_spin.value()))
+        export_curve_csv = (
+            bool(self.export_curve_csv_check.isChecked())
+            if self.export_curve_csv_check.isVisible()
+            else False
+        )
+        return (
+            custom_name or None,
+            float(self.calibration_spin.value()),
+            export_curve_csv,
+        )
 
 
 class RcsCompareConfigDialog(QtWidgets.QDialog):
@@ -1879,6 +1931,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._rcs_segment_run_labels: Optional[List[int]] = None
         # RCS plotting workflow state
         self._rcs_base_file_path: Optional[str] = None
+        self._rcs_curve_csv_source_paths: List[str] = []
         # When True, do not overlay reference limit bands/lines on the plot.
         # Used for "选择数据绘RCS图" as requested.
         self._rcs_hide_reference_limits: bool = False
@@ -1917,6 +1970,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._motion_stop_last_popup_ts = 0.0
         self._motion_stop_last_popup_key = ""
         self._radar_stop_threshold = 1.0
+        self._radar_plot_wide_lateral_active = False
         self._path_speed = DEFAULT_SEGMENT_SPEED_MPS
         self._path_tracking_mode = "stanley"
         self._tracking_tuning: Dict[str, float] = {
@@ -1929,26 +1983,33 @@ class MainWindow(QtWidgets.QMainWindow):
             "stanley_lateral_kp": 1.05,
             "stanley_lateral_kd": 0.46,
         }
-        self._traj_default_dist = 2.0
+        self._traj_default_dist = DEFAULT_LINE_PLAN_DIST_M
         self._traj_default_radius = 40.0
         self._traj_default_angle = 360.0
         self._traj_default_circle_direction = "ccw"
-        self._traj_default_line_speed = DEFAULT_SEGMENT_SPEED_MPS
+        self._traj_default_line_speed = DEFAULT_LINE_PLAN_SPEED_MPS
         self._traj_default_circle_speed = DEFAULT_SEGMENT_SPEED_MPS
         self._traj_default_accel_dist = DEFAULT_ACCEL_DIST_M
         self._traj_default_decel_dist = DEFAULT_DECEL_DIST_M
         self._radial_measurement_spec: Optional[RadialMeasurementSpec] = None
-        self._radial_default_angle_cycles = {
-            angle: 5 for angle in [0, 45, 90, 135, 180, 225, 270, 315]
-        }
+        self._radial_default_angle_cycles = {angle: 5 for angle in range(0, 360, 30)}
         # 星型测量：UI 改为「固定直线长度」+「距离目标最近距离」
         self._radial_default_inner_radius = 4.0
         self._radial_default_outer_radius = 54.0
         self._radial_default_line_length_m = 46.0
+        self._radial_default_speed_mps = DEFAULT_RADIAL_MEASUREMENT_SPEED_MPS
+        self._radial_rcs_session_dir: Optional[Path] = None
+        self._radial_rcs_expected_segments: List[str] = []
+        self._radial_rcs_started_segments: Set[str] = set()
+        self._radial_rcs_finished_segments: Set[str] = set()
+        self._radial_rcs_failed_segments: Set[str] = set()
         self._preset_paths: Dict[str, List[Tuple[float, float]]] = {}
         self._preset_ranges: Dict[str, List[SegmentRange]] = {}
+        self._preset_segment_kinds: Dict[str, List[str]] = {}
         self._preset_path_frames: Dict[str, PathReferenceFrame] = {}
         self._planned_ranges: Optional[List[SegmentRange]] = None
+        # 与轨迹规划器一致的逐段类型：\"line\" / \"circle\"；缺省则回退到几何判直
+        self._planned_segment_kinds: Optional[List[str]] = None
         self._planned_range_task_names: List[Optional[str]] = []
         self._loaded_task_sequence_names: List[str] = []
         self._loaded_task_transition_count = 0
@@ -2374,6 +2435,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         vbtn.addWidget(self.label_path_tracking_mode)
         vbtn.addWidget(self.combo_path_tracking_mode)
+        # 隐藏轨迹跟踪算法选择，固定使用初始化时的默认（见 _path_tracking_mode）
+        self.label_path_tracking_mode.setVisible(False)
+        self.combo_path_tracking_mode.setVisible(False)
         vbtn.addWidget(self.label_path_coord_hint)
         vbtn.addWidget(self.label_path_origin_point)
         vbtn.addWidget(anchor_row)
@@ -2490,6 +2554,22 @@ class MainWindow(QtWidgets.QMainWindow):
                 return mode
         return str(getattr(self, "_rcs_plot_mode", "distance") or "distance")
 
+    def _select_rcs_plot_mode(self, mode: str) -> None:
+        """切换 RCS 绘图模式（距离-RCS / 圆周-RCS），并同步内部状态。"""
+        m = str(mode or "").strip()
+        if m not in {"distance", "orbit"}:
+            return
+        self._rcs_plot_mode = m
+        combo = getattr(self, "rcs_plot_mode_combo", None)
+        if combo is None:
+            return
+        for i in range(combo.count()):
+            if combo.itemData(i) == m:
+                combo.blockSignals(True)
+                combo.setCurrentIndex(i)
+                combo.blockSignals(False)
+                return
+
     def _ensure_rcs_axes(self, plot_mode: str) -> None:
         projection = "polar" if plot_mode == "orbit" else "cartesian"
         if projection == getattr(self, "_rcs_ax_projection", "") and getattr(self, "rcs_ax", None) is not None:
@@ -2538,9 +2618,13 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_orbit_polar_series_from_rows(
         self, rows: List[Dict[str, float]]
     ) -> Optional[Dict[str, Any]]:
-        """极径为 RCS(dBsm)：极角按记录时间顺序线性映射到 [0, 2π]（铺满 360°），不使用文件中的 theta_rad。
+        """极径为 RCS(dBsm)，极角按采样时间顺序线性映射到 [0, 2π]。
 
         Matplotlib 极坐标径向 r 需非负，内部用 floor 平移，刻度仍标真实 dBsm。
+        相邻时间点 RCS 跳变达到 ORBIT_RCS_ADJACENT_JUMP_REJECT_DB 时剔除当前点。
+        若数据来自 Cluster Raw 重放，rcs_filt 应与直线段相同：
+        先行内 RCS00+RCS01 线性功率合并（见 _parse_cluster_rcs_csv / _cluster_rcs_rowwise_rcs00_rcs01_linear_power）。
+        不使用 theta_rad 作极角；与几何方位角无关。
         """
         if len(rows) < 2:
             return None
@@ -2557,32 +2641,48 @@ class MainWindow(QtWidgets.QMainWindow):
         if len(rows_sorted) < 2:
             return None
 
-        t_arr = np.asarray([float(r["t"]) for r in rows_sorted], dtype=float)
-        values = np.asarray([float(r["rcs_filt"]) for r in rows_sorted], dtype=float)
+        filtered_rows: List[Dict[str, float]] = []
+        last_v: Optional[float] = None
+        jump_thr = float(ORBIT_RCS_ADJACENT_JUMP_REJECT_DB)
+        for r in rows_sorted:
+            v = float(r["rcs_filt"])
+            if last_v is not None and abs(v - last_v) >= jump_thr:
+                continue
+            filtered_rows.append(r)
+            last_v = v
+        if len(filtered_rows) < 2:
+            return None
+
+        t_arr = np.asarray([float(r["t"]) for r in filtered_rows], dtype=float)
+        values = np.asarray([float(r["rcs_filt"]) for r in filtered_rows], dtype=float)
         span_t = float(t_arr[-1] - t_arr[0])
         if span_t <= 1e-12:
             angles = np.linspace(0.0, 2.0 * math.pi, t_arr.size, dtype=float, endpoint=True)
         else:
             angles = (t_arr - t_arr[0]) / span_t * (2.0 * math.pi)
+        fit_angles, fit_values = self._bin_orbit_rcs_by_angle(
+            angles,
+            values,
+            ORBIT_RCS_ANGLE_BIN_DEG,
+        )
 
         span_deg = 360.0
         rmin = float(np.min(values))
         rmax = float(np.max(values))
-        span_v = rmax - rmin
-        pad = max(0.5, 0.02 * (span_v if span_v > 1e-6 else max(abs(rmin), 1.0) * 0.02 + 1.0))
-        floor = rmin - pad
-        r_plot = values - floor
-        r_top = float(np.max(r_plot)) + 0.5 * pad
-        tick_count = 5
-        if span_v <= 1e-9:
-            tick_values = np.linspace(rmin, rmin + 1.0, tick_count)
-        else:
-            tick_values = np.linspace(rmin, rmax, tick_count)
+        tick_step = max(float(ORBIT_RCS_RADIAL_TICK_STEP_DB), 1e-6)
+        tick_start = math.floor(rmin / tick_step) * tick_step
+        tick_end = math.ceil(rmax / tick_step) * tick_step
+        if tick_end <= tick_start:
+            tick_end = tick_start + tick_step
+        tick_values = np.arange(tick_start, tick_end + tick_step * 0.5, tick_step, dtype=float)
+        floor = tick_start - max(0.5, tick_step * 0.1)
+        radii = values - floor
         tick_positions = tick_values - floor
+        r_top = float(np.max(tick_positions)) + tick_step * 0.2
         return {
             "mode": "abs_dbsm",
             "angles": angles,
-            "radii": r_plot,
+            "radii": radii,
             "values": values,
             "tick_values": tick_values,
             "tick_positions": tick_positions,
@@ -2591,8 +2691,105 @@ class MainWindow(QtWidgets.QMainWindow):
             "value_min": rmin,
             "value_max": rmax,
             "r_floor": floor,
+            "radial_tick_step_db": tick_step,
+            "raw_point_count": len(rows_sorted),
+            "filtered_point_count": len(filtered_rows),
+            "jump_reject_db": jump_thr,
             "orbit_angle_by_time": True,
+            "fit_angles": fit_angles,
+            "fit_values": fit_values,
+            "angle_bin_deg": float(ORBIT_RCS_ANGLE_BIN_DEG),
+            "fit_point_count": int(fit_angles.size),
         }
+
+    @staticmethod
+    def _bin_orbit_rcs_by_angle(
+        angles: np.ndarray,
+        values: np.ndarray,
+        bin_deg: float = ORBIT_RCS_ANGLE_BIN_DEG,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """按平铺后的角度分箱，箱内 RCS 使用 dBsm 算术平均。"""
+        a = np.asarray(angles, dtype=float)
+        v = np.asarray(values, dtype=float)
+        if a.size == 0 or v.size == 0:
+            return np.asarray([], dtype=float), np.asarray([], dtype=float)
+        n = min(int(a.size), int(v.size))
+        a = a[:n]
+        v = v[:n]
+        mask = np.isfinite(a) & np.isfinite(v)
+        if int(np.count_nonzero(mask)) < 2:
+            return np.asarray([], dtype=float), np.asarray([], dtype=float)
+        a = a[mask]
+        v = v[mask]
+
+        two_pi = 2.0 * math.pi
+        try:
+            bin_deg_eff = float(bin_deg)
+        except (TypeError, ValueError):
+            bin_deg_eff = 1.0
+        if not math.isfinite(bin_deg_eff):
+            bin_deg_eff = 1.0
+        bin_deg_eff = max(bin_deg_eff, 1e-3)
+        n_bins = max(1, int(math.ceil(360.0 / bin_deg_eff)))
+        bin_w = two_pi / float(n_bins)
+        # 这里保留 [0, 2π] 的铺展语义；终点 2π 归入最后一个角度箱，不回绕到 0。
+        a = np.clip(a, 0.0, np.nextafter(two_pi, 0.0))
+        bin_ids = np.floor(a / bin_w).astype(np.int64)
+        bin_ids = np.clip(bin_ids, 0, n_bins - 1)
+
+        by_bin: Dict[int, List[float]] = defaultdict(list)
+        for bid, val in zip(bin_ids.tolist(), v.tolist()):
+            fv = float(val)
+            if math.isfinite(fv):
+                by_bin[int(bid)].append(fv)
+        if not by_bin:
+            return np.asarray([], dtype=float), np.asarray([], dtype=float)
+
+        out_angles: List[float] = []
+        out_values: List[float] = []
+        for bid in sorted(by_bin.keys()):
+            vals = by_bin[int(bid)]
+            if not vals:
+                continue
+            out_angles.append((float(bid) + 0.5) * bin_w)
+            out_values.append(float(np.mean(np.asarray(vals, dtype=float))))
+        return np.asarray(out_angles, dtype=float), np.asarray(out_values, dtype=float)
+
+    def _planned_segment_kind_for_index(self, seg_idx: int) -> Optional[str]:
+        """返回规划器逐段类型：circle / line；无元数据时返回 None（由几何判定）。"""
+        if seg_idx < 1:
+            return None
+        kinds = getattr(self, "_planned_segment_kinds", None) or []
+        if seg_idx > len(kinds):
+            return None
+        raw = str(kinds[seg_idx - 1] or "").strip().lower()
+        return raw if raw in ("circle", "line") else None
+
+    def _planned_range_task_name_for_index(self, seg_idx: int) -> str:
+        if seg_idx < 1:
+            return ""
+        names = list(getattr(self, "_planned_range_task_names", []) or [])
+        if seg_idx > len(names):
+            return ""
+        return str(names[seg_idx - 1] or "").strip()
+
+    def _segment_index_is_radial_named_line(self, seg_idx: int) -> bool:
+        """星型测量中带任务名的测量往返直线段，不能被稳定化后的轻微曲率误判为曲线。"""
+        if getattr(self, "_radial_measurement_spec", None) is None:
+            return False
+        name = self._planned_range_task_name_for_index(seg_idx)
+        return self._parse_radial_rcs_task_name(name) is not None
+
+    def _segment_geometry_is_straight(self, seg_idx: int, points: List[Tuple[float, float]]) -> bool:
+        """分段是否按直线处理：优先规划器标注，其次折线曲率判据。"""
+        kind = self._planned_segment_kind_for_index(seg_idx)
+        if kind == "circle":
+            return False
+        if kind == "line":
+            return len(points) >= 2
+        if self._segment_index_is_radial_named_line(seg_idx):
+            return len(points) >= 2
+        return self._is_nearly_straight_segment(points)
 
     def _segment_index_is_arc_segment(self, seg_idx: int) -> bool:
         # 星型/径向测量轨迹：按「直线-距离RCS」工作流记录与绘图，
@@ -2602,6 +2799,8 @@ class MainWindow(QtWidgets.QMainWindow):
         ranges = getattr(self, "_planned_ranges", None) or []
         if seg_idx < 1 or seg_idx > len(ranges):
             return False
+        if self._planned_segment_kind_for_index(seg_idx) == "circle":
+            return True
         sr = self._normalize_segment_range(ranges[seg_idx - 1])
         start_idx, end_idx = int(sr[0]), int(sr[1])
         if end_idx <= start_idx:
@@ -2617,6 +2816,8 @@ class MainWindow(QtWidgets.QMainWindow):
         ranges = getattr(self, "_planned_ranges", None) or []
         if seg_idx < 1 or seg_idx > len(ranges):
             return False
+        if self._planned_segment_kind_for_index(seg_idx) == "circle":
+            return False
         sr = self._normalize_segment_range(ranges[seg_idx - 1])
         start_idx, end_idx = int(sr[0]), int(sr[1])
         speed_sign = float(sr[2])
@@ -2627,76 +2828,166 @@ class MainWindow(QtWidgets.QMainWindow):
         pts = self.loaded_path_points[start_idx : end_idx + 1]
         if len(pts) < 2:
             return False
-        # 星型/径向测量轨迹：直线段希望“全记录”，不依赖严格直线判定
+        return self._segment_geometry_is_straight(seg_idx, pts)
+
+    def _segment_index_is_forward_curved_segment(self, seg_idx: Optional[int]) -> bool:
+        """前进且为圆弧段（或几何非直线），用于分段轨迹中启动圆周 RCS（极坐标采样 CSV + 宽横向 Cluster CSV）。"""
+        if seg_idx is None:
+            return False
+        ranges = getattr(self, "_planned_ranges", None) or []
+        if seg_idx < 1 or seg_idx > len(ranges):
+            return False
+        sr = self._normalize_segment_range(ranges[seg_idx - 1])
+        start_idx, end_idx = int(sr[0]), int(sr[1])
+        speed_sign = float(sr[2])
+        if end_idx <= start_idx:
+            return False
+        if speed_sign <= 0:
+            return False
         if getattr(self, "_radial_measurement_spec", None) is not None:
+            return False
+        if self._planned_segment_kind_for_index(seg_idx) == "circle":
             return True
-        return self._is_nearly_straight_segment(pts)
+        if self._planned_segment_kind_for_index(seg_idx) == "line":
+            return False
+        pts = self.loaded_path_points[start_idx : end_idx + 1]
+        if len(pts) < 2:
+            return False
+        return not self._is_nearly_straight_segment(pts)
 
-    def _compose_orbit_rcs_filename(
-        self,
-        trajectory_name: Optional[str] = None,
-        target_name: Optional[str] = None,
-        timestamp: Optional[float] = None,
-    ) -> str:
-        traj_token = self._safe_filename_token(trajectory_name or self._get_current_path_name())
-        target_token = self._safe_filename_token(target_name or self._get_selected_rcs_target_name())
-        stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(float(timestamp or time.time())))
-        return f"{traj_token}__{target_token}__orbit_rcs__{stamp}.txt"
+    @staticmethod
+    def _is_orbit_rcs_polar_csv(path: Path) -> bool:
+        """是否为圆周极坐标采样 CSV（文件名含 __orbit_rcs__，或表头含极坐标列）。"""
+        if path.suffix.lower() != ".csv":
+            return False
+        if "__orbit_rcs__" in path.name:
+            return True
+        try:
+            with path.open(encoding="utf-8-sig", newline="") as f:
+                reader = csv.reader(f)
+                header = next(reader, None)
+            if not header:
+                return False
+            h = {str(x).strip().lower() for x in header if str(x).strip()}
+            need = {"t", "theta_rad", "rcs_raw", "rcs_filt", "oid"}
+            x_ok = ("x_m" in h or "x" in h) and ("y_m" in h or "y" in h)
+            return need.issubset(h) and x_ok
+        except OSError:
+            return False
 
-    def _save_orbit_rcs_file(
-        self,
-        rows: List[Dict[str, float]],
-        trajectory_name: str,
-        target_name: str,
-    ) -> Optional[str]:
-        if len(rows) < 2:
-            return None
-        save_dir = Path(self._rcs_save_dir)
-        save_dir.mkdir(parents=True, exist_ok=True)
-        file_path = save_dir / self._compose_orbit_rcs_filename(
-            trajectory_name=trajectory_name,
-            target_name=target_name,
-        )
-        lines = [
-            f"{ORBIT_RCS_FILE_MAGIC} nominal_forward_m={ORBIT_RCS_NOMINAL_FORWARD_M} "
-            f"gate_m={ORBIT_RCS_FORWARD_GATE_M}",
-            "# t_s\ttheta_rad\trcs_raw\trcs_filt\tx_m\ty_m\toid",
-        ]
-        for r in rows:
-            lines.append(
-                f"{float(r['t']):.6f}\t{float(r['theta_rad']):.6f}\t{float(r['rcs_raw']):.3f}\t"
-                f"{float(r['rcs_filt']):.3f}\t{float(r['x']):.3f}\t{float(r['y']):.3f}\t{int(r['oid'])}"
-            )
-        file_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        return str(file_path)
+    @staticmethod
+    def _cluster_csv_has_dri_cluster_header(path: Path) -> bool:
+        """是否为 Cluster Raw（Time + DX00…RCS19）表头。"""
+        if path.suffix.lower() != ".csv":
+            return False
+        try:
+            with path.open(encoding="utf-8-sig", newline="") as f:
+                reader = csv.reader(f)
+                for row in reader:
+                    if not row:
+                        continue
+                    if row[0].strip() == "Time" and any((c or "").strip() == "DX00" for c in row):
+                        return True
+        except OSError:
+            return False
+        return False
 
-    def _parse_orbit_rcs_file(self, file_path: str) -> List[Dict[str, float]]:
+    @staticmethod
+    def _cluster_csv_data_row_count(path: Path) -> int:
+        """统计 Cluster Raw 表头后的数据行数，用于判断分段 CSV 是否真正写入。"""
+        if path.suffix.lower() != ".csv":
+            return 0
+        count = 0
+        header_seen = False
+        try:
+            with path.open(encoding="utf-8-sig", newline="") as f:
+                reader = csv.reader(f)
+                for row in reader:
+                    if not row:
+                        continue
+                    if not header_seen:
+                        if row[0].strip() == "Time" and any((c or "").strip() == "DX00" for c in row):
+                            header_seen = True
+                        continue
+                    if any(str(c or "").strip() for c in row):
+                        count += 1
+        except OSError:
+            return 0
+        return count
+
+    @staticmethod
+    def _is_orbit_cluster_raw_csv(path: Path) -> bool:
+        """是否为圆周段 Cluster Raw CSV（如 *_orbit_cluster_segXX_Raw_*.csv）。"""
+        if path.suffix.lower() != ".csv":
+            return False
+        marker_tokens = ("orbit_cluster", "_orbit_", "__orbit_rcs__", "圆周")
+        name_has_marker = any(token in path.name.casefold() for token in marker_tokens)
+        metadata_has_marker = False
+        try:
+            with path.open(encoding="utf-8-sig", newline="") as f:
+                reader = csv.reader(f)
+                for row in reader:
+                    if not row:
+                        continue
+                    row_text = " ".join(str(c or "").strip() for c in row).casefold()
+                    metadata_has_marker = metadata_has_marker or any(
+                        token in row_text for token in marker_tokens
+                    )
+                    if row[0].strip() == "Time" and any((c or "").strip() == "DX00" for c in row):
+                        return bool(name_has_marker or metadata_has_marker)
+        except OSError:
+            return False
+        return False
+
+    def _parse_orbit_rcs_csv(self, file_path: str) -> List[Dict[str, float]]:
         path = Path(file_path)
-        lines = path.read_text(encoding="utf-8-sig").splitlines()
         rows: List[Dict[str, float]] = []
-        for raw_line in lines:
-            line = raw_line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = [p for p in re.split(r"[\t,\s]+", line) if p]
-            if len(parts) < 7:
-                continue
-            try:
-                rows.append(
-                    {
-                        "t": float(parts[0]),
-                        "theta_rad": float(parts[1]),
-                        "rcs_raw": float(parts[2]),
-                        "rcs_filt": float(parts[3]),
-                        "x": float(parts[4]),
-                        "y": float(parts[5]),
-                        "oid": int(float(parts[6])),
-                    }
-                )
-            except ValueError:
-                continue
+        with path.open(encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            if not reader.fieldnames:
+                raise ValueError("圆周RCS CSV 无表头或为空")
+            lower = {str(k).strip().lower(): k for k in reader.fieldnames if k is not None}
+
+            def _col(*names: str) -> Optional[str]:
+                for n in names:
+                    if n in lower:
+                        return lower[n]
+                return None
+
+            c_t = _col("t", "time_s", "time")
+            c_th = _col("theta_rad")
+            c_rr = _col("rcs_raw")
+            c_rf = _col("rcs_filt", "rcs_filtered")
+            c_x = _col("x_m", "x")
+            c_y = _col("y_m", "y")
+            c_oid = _col("oid", "cluster_id")
+            if not all([c_t, c_th, c_rr, c_rf, c_x, c_y, c_oid]):
+                raise ValueError("圆周RCS CSV 表头缺少必需列 (t,theta_rad,rcs_raw,rcs_filt,x_m,y_m,oid)")
+            for raw in reader:
+                if not raw:
+                    continue
+                try:
+                    def _get(key: str) -> str:
+                        v = raw.get(key)
+                        if v is None:
+                            raise ValueError
+                        return str(v).strip()
+
+                    rows.append(
+                        {
+                            "t": float(_get(c_t)),
+                            "theta_rad": float(_get(c_th)),
+                            "rcs_raw": float(_get(c_rr)),
+                            "rcs_filt": float(_get(c_rf)),
+                            "x": float(_get(c_x)),
+                            "y": float(_get(c_y)),
+                            "oid": int(float(_get(c_oid))),
+                        }
+                    )
+                except (ValueError, TypeError, KeyError):
+                    continue
         if len(rows) < 2:
-            raise ValueError("圆周RCS文件有效点不足")
+            raise ValueError("圆周RCS CSV 有效点不足")
         return rows
 
     def _get_rcs_orbit_plot_series(self) -> Optional[Dict[str, Any]]:
@@ -2705,50 +2996,27 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._rcs_orbit_samples:
             return None
 
-        angles = np.asarray([sample.get("angle_rad", np.nan) for sample in self._rcs_orbit_samples], dtype=float)
-        values = np.asarray([sample.get("rcs_filt", np.nan) for sample in self._rcs_orbit_samples], dtype=float)
-        valid = np.isfinite(angles) & np.isfinite(values)
-        if int(np.count_nonzero(valid)) < 3:
-            return None
-        angles = angles[valid]
-        values = values[valid]
+        rows_like: List[Dict[str, float]] = []
+        for i, sample in enumerate(self._rcs_orbit_samples):
+            try:
+                v = float(sample.get("rcs_filt", float("nan")))
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(v):
+                continue
+            try:
+                t = float(sample.get("timestamp", float("nan")))
+            except (TypeError, ValueError):
+                t = float("nan")
+            if not np.isfinite(t):
+                t = float(i)
+            rows_like.append({"t": t, "rcs_filt": v})
+        if len(rows_like) >= 2:
+            ser = self._build_orbit_polar_series_from_rows(rows_like)
+            if ser is not None:
+                return ser
 
-        unwrapped = np.unwrap(angles)
-        span_deg = math.degrees(float(np.max(unwrapped) - np.min(unwrapped))) if unwrapped.size else 0.0
-        angles_mod = np.mod(angles, 2.0 * math.pi)
-        order = np.argsort(angles_mod)
-        angles_sorted = angles_mod[order]
-        values_sorted = values[order]
-
-        value_min = float(np.min(values_sorted))
-        value_max = float(np.max(values_sorted))
-        value_span = max(1e-6, value_max - value_min)
-        radial_padding = max(0.5, 0.08 * value_span)
-        radii = (values_sorted - value_min) + radial_padding
-
-        if span_deg >= 300.0 and angles_sorted.size >= 8:
-            angles_sorted = np.concatenate([angles_sorted, [angles_sorted[0] + 2.0 * math.pi]])
-            radii = np.concatenate([radii, [radii[0]]])
-            values_sorted = np.concatenate([values_sorted, [values_sorted[0]]])
-
-        tick_count = 4
-        if value_span <= 1e-6:
-            tick_values = np.linspace(value_min, value_min + 1.0, tick_count)
-        else:
-            tick_values = np.linspace(value_min, value_max, tick_count)
-        tick_positions = (tick_values - value_min) + radial_padding
-
-        return {
-            "mode": "legacy_scaled",
-            "angles": angles_sorted,
-            "radii": radii,
-            "values": values_sorted,
-            "tick_values": tick_values,
-            "tick_positions": tick_positions,
-            "span_deg": span_deg,
-            "value_min": value_min,
-            "value_max": value_max,
-        }
+        return None
 
     def _create_log_panel(self) -> QtWidgets.QFrame:
         log_frame = QtWidgets.QFrame()
@@ -2820,7 +3088,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.radar_plot.setLabel("left", "前方 DistLong(DX)", "m")
         self.radar_plot.setLabel("bottom", "横向 DistLat(DY)", "m")
         self.radar_plot.setXRange(-2.5, 2.5)
-        self.radar_plot.setYRange(0, 52)
+        self.radar_plot.setYRange(0, 62)
         self.radar_plot.setAspectLocked(True)
         self.radar_plot.showGrid(x=True, y=True, alpha=0.3)
         self.radar_plot.setMinimumSize(self._scaled_px(520), self._scaled_px(420))
@@ -4060,6 +4328,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._migrate_matching_outputs(
                 [
                     "*__*__*.txt",
+                    "*__orbit_rcs__*.csv",
                     "rcs_fit_id*.png",
                     "fitted_id*.pdf",
                     "rcs_plot_*.png",
@@ -4617,7 +4886,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_rcs_save_dir_button_tooltip(self) -> None:
         if hasattr(self, "btn_select_rcs_save_dir") and self.btn_select_rcs_save_dir is not None:
             self.btn_select_rcs_save_dir.setToolTip(
-                f"从 {self._rcs_save_dir} 选择 Cluster RCS CSV（或圆周 orbit_rcs.txt）并绘图。"
+                f"从 {self._rcs_save_dir} 选择 Cluster Raw CSV；圆周-RCS 图由 Raw 经行内功率合并后按时间平铺。"
             )
 
     def _on_select_rcs_save_dir(self) -> None:
@@ -4634,7 +4903,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         file_paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
             self,
-            "选择已保存的 Cluster RCS CSV 或 RCS 数据（可多选合并拟合）",
+            "选择已保存的 Cluster Raw CSV（可多选合并拟合，仅距离-RCS）",
             str(self._rcs_save_dir),
             "CSV 表格 (*.csv);;所有文件(*)",
         )
@@ -4654,17 +4923,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 ref_summary,
                 default_custom_name=curve.display_name,
                 default_calibration_db=self._rcs_plot_calibration_db,
+                enable_curve_csv_export=True,
                 parent=self,
             )
             if plot_dlg.exec_() != QtWidgets.QDialog.Accepted:
                 return
-            custom_name, cal_db = plot_dlg.values()
+            custom_name, cal_db, export_curve_csv = plot_dlg.values()
             self._rcs_plot_calibration_db = cal_db
             if custom_name:
                 curve = replace(curve, display_name=custom_name)
             show_ref = bool(self._rcs_ref_class and self._rcs_ref_angle and self._rcs_ref_limits is not None)
             self._rcs_hide_reference_limits = not show_ref
             self._rcs_base_file_path = None
+            self._rcs_curve_csv_source_paths = [str(p) for p in file_paths]
             self._loaded_rcs_curves = []
             self._orbit_polar_cached_series = None
             self.rcs_recorder.reset()
@@ -4690,27 +4961,32 @@ class MainWindow(QtWidgets.QMainWindow):
             self._rcs_plot_mode = "distance"
             self._ensure_rcs_axes("distance")
             cal_note = f" | 标定{cal_db:+.2f}dB" if abs(float(cal_db)) > 1e-9 else ""
+            csv_note = ""
+            if export_curve_csv:
+                _filtered_paths, combined_path = self._try_export_rcs_curve_csvs(
+                    list(file_paths),
+                    cal_db,
+                )
+                if combined_path is not None:
+                    csv_note = f" | CSV={combined_path.name}"
             self.rcs_status_label.setText(
-                f"RCS绘图: 已合并 {len(file_paths)} 个文件 | 总点数={curve.point_count}{cal_note}"
+                f"RCS绘图: 已合并 {len(file_paths)} 个文件 | 总点数={curve.point_count}{cal_note}{csv_note}"
             )
             self._log(
                 f"RCS合并绘图数据已载入: 文件数={len(file_paths)} | 总点数={curve.point_count}"
-                f"{cal_note}"
+                f"{cal_note}{csv_note}"
             )
             self._draw_rcs()
             return
 
         file_path = str(file_paths[0])
 
-        head_lines = Path(file_path).read_text(encoding="utf-8-sig").splitlines()[:12]
-        is_orbit_file = any(
-            str(ln).strip().startswith(ORBIT_RCS_FILE_MAGIC) for ln in head_lines
-        )
+        is_orbit_file = MainWindow._is_orbit_rcs_polar_csv(Path(file_path))
         if is_orbit_file:
             try:
-                orows = self._parse_orbit_rcs_file(file_path)
+                orows = self._parse_orbit_rcs_csv(file_path)
             except Exception as exc:
-                QtWidgets.QMessageBox.warning(self, "载入失败", f"读取圆周RCS文件失败: {exc}")
+                QtWidgets.QMessageBox.warning(self, "载入失败", f"读取圆周RCS CSV 失败: {exc}")
                 self._log(f"圆周RCS载入失败: {exc}")
                 return
             ref_summary = self._format_rcs_reference_summary()
@@ -4720,16 +4996,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 ref_summary,
                 default_custom_name=stem,
                 default_calibration_db=self._rcs_plot_calibration_db,
+                enable_curve_csv_export=False,
                 parent=self,
             )
             if plot_dlg.exec_() != QtWidgets.QDialog.Accepted:
                 return
-            custom_name, cal_db = plot_dlg.values()
+            custom_name, cal_db, _export_curve_csv = plot_dlg.values()
             self._rcs_plot_calibration_db = cal_db
             self._orbit_polar_cached_series = self._build_orbit_polar_series_from_rows(orows)
             # 圆周图不叠加距离-RCS参考上下限
             self._rcs_hide_reference_limits = True
             self._rcs_base_file_path = str(file_path)
+            self._rcs_curve_csv_source_paths = []
             self._loaded_rcs_curves = []
             self.rcs_recorder.reset()
             self._rcs_segment_run_labels = None
@@ -4754,9 +5032,70 @@ class MainWindow(QtWidgets.QMainWindow):
             self._ensure_rcs_axes("orbit")
             cal_note = f" | 标定{cal_db:+.2f}dB" if abs(float(cal_db)) > 1e-9 else ""
             self.rcs_status_label.setText(
-                f"圆周RCS: 已载入 {Path(file_path).name} | 点数={len(orows)} | 径向=RCS(dBsm){cal_note}"
+                f"圆周RCS: 已载入 {Path(file_path).name} | 点数={len(orows)} | "
+                f"角度分箱均值曲线 | 径向=RCS(dBsm){cal_note}"
             )
-            self._log(f"圆周RCS文件已载入: {file_path} | 点数={len(orows)}{cal_note}")
+            self._log(
+                f"圆周RCS CSV 已载入: {file_path} | 点数={len(orows)} | "
+                f"平铺到2π后按{ORBIT_RCS_ANGLE_BIN_DEG:g}°分箱算术平均{cal_note}"
+            )
+            self._draw_rcs()
+            return
+
+        if MainWindow._is_orbit_cluster_raw_csv(Path(file_path)):
+            try:
+                orows = self._orbit_plot_rows_from_cluster_raw_path(file_path)
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(self, "载入失败", f"读取圆周 Cluster Raw 失败: {exc}")
+                self._log(f"圆周 Cluster Raw 载入失败: {exc}")
+                return
+            if len(orows) < 2:
+                QtWidgets.QMessageBox.warning(self, "载入失败", "圆周 Cluster Raw 有效 RCS 点不足")
+                self._log(f"圆周 Cluster Raw 载入失败: 有效点不足 | 文件={file_path}")
+                return
+            ref_summary = self._format_rcs_reference_summary()
+            stem = Path(file_path).stem
+            plot_dlg = RcsPlotConfigDialog(
+                file_path,
+                ref_summary,
+                default_custom_name=stem,
+                default_calibration_db=self._rcs_plot_calibration_db,
+                enable_curve_csv_export=False,
+                parent=self,
+            )
+            if plot_dlg.exec_() != QtWidgets.QDialog.Accepted:
+                return
+            custom_name, cal_db, _export_curve_csv = plot_dlg.values()
+            self._rcs_plot_calibration_db = cal_db
+            self._orbit_polar_cached_series = self._build_orbit_polar_series_from_rows(orows)
+            self._rcs_hide_reference_limits = True
+            self._rcs_base_file_path = str(file_path)
+            self._rcs_curve_csv_source_paths = []
+            self._loaded_rcs_curves = []
+            self.rcs_recorder.reset()
+            self._rcs_segment_run_labels = None
+            self.rcs_recorder._cur = []
+            self.rcs_recorder._ended = True
+            self.rcs_recorder.oid = None
+            self._rcs_recording = False
+            self._rcs_show_only_fitted = False
+            self._rcs_orbit_samples = []
+            self._rcs_fitted = None
+            self._rcs_active_segment_index = None
+            self._rcs_active_path_name = None
+            self._rcs_active_target_name = None
+            self._rcs_target_name = custom_name or stem
+            self._select_rcs_plot_mode("orbit")
+            self._ensure_rcs_axes("orbit")
+            cal_note = f" | 标定{cal_db:+.2f}dB" if abs(float(cal_db)) > 1e-9 else ""
+            self.rcs_status_label.setText(
+                f"圆周RCS: 已载入 {Path(file_path).name} | 点数={len(orows)} | "
+                f"RCS00/RCS01功率合并 | 角度分箱均值曲线 | 径向=RCS(dBsm){cal_note}"
+            )
+            self._log(
+                f"圆周 Cluster Raw 已载入: {file_path} | 点数={len(orows)} | "
+                f"RCS00/RCS01功率合并 | 时间平铺到2π后按{ORBIT_RCS_ANGLE_BIN_DEG:g}°分箱算术平均{cal_note}"
+            )
             self._draw_rcs()
             return
 
@@ -4773,11 +5112,12 @@ class MainWindow(QtWidgets.QMainWindow):
             ref_summary,
             default_custom_name=curve.display_name,
             default_calibration_db=self._rcs_plot_calibration_db,
+            enable_curve_csv_export=True,
             parent=self,
         )
         if plot_dlg.exec_() != QtWidgets.QDialog.Accepted:
             return
-        custom_name, cal_db = plot_dlg.values()
+        custom_name, cal_db, export_curve_csv = plot_dlg.values()
         self._rcs_plot_calibration_db = cal_db
         if custom_name:
             curve = replace(curve, display_name=custom_name)
@@ -4786,8 +5126,16 @@ class MainWindow(QtWidgets.QMainWindow):
         show_ref = bool(self._rcs_ref_class and self._rcs_ref_angle and self._rcs_ref_limits is not None)
         self._rcs_hide_reference_limits = not show_ref
         self._rcs_base_file_path = str(curve.file_path)
+        self._rcs_curve_csv_source_paths = [str(curve.file_path)]
         self._loaded_rcs_curves = []
         self._orbit_polar_cached_series = None
+        if MainWindow._cluster_csv_has_dri_cluster_header(Path(curve.file_path)):
+            try:
+                orows = self._orbit_plot_rows_from_cluster_raw_path(str(curve.file_path))
+                if len(orows) >= 2:
+                    self._orbit_polar_cached_series = self._build_orbit_polar_series_from_rows(orows)
+            except Exception:
+                self._orbit_polar_cached_series = None
         self.rcs_recorder.reset()
         self.rcs_recorder.segments = [list(seg) for seg in curve.segments]
         self.rcs_recorder._cur = []
@@ -4813,12 +5161,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self._ensure_rcs_axes("distance")
 
         cal_note = f" | 标定{cal_db:+.2f}dB" if abs(float(cal_db)) > 1e-9 else ""
+        csv_note = ""
+        if export_curve_csv:
+            _filtered_paths, combined_path = self._try_export_rcs_curve_csvs(
+                [str(curve.file_path)],
+                cal_db,
+            )
+            if combined_path is not None:
+                csv_note = f" | CSV={combined_path.name}"
         self.rcs_status_label.setText(
-            f"RCS绘图: 已载入 {Path(curve.file_path).name} | 点数={curve.point_count}{cal_note}"
+            f"RCS绘图: 已载入 {Path(curve.file_path).name} | 点数={curve.point_count}{cal_note}{csv_note}"
         )
         self._log(
             f"RCS绘图数据已载入(无参考上下限): 文件={curve.file_path} | 点数={curve.point_count}"
-            f"{cal_note}"
+            f"{cal_note}{csv_note}"
         )
         self._draw_rcs()
 
@@ -4829,6 +5185,10 @@ class MainWindow(QtWidgets.QMainWindow):
         segment_index: Optional[int] = None,
         timestamp: Optional[float] = None,
     ) -> str:
+        if getattr(self, "_radial_measurement_spec", None) is not None:
+            tn = str(trajectory_name or self._get_current_path_name() or "").strip()
+            if self._parse_radial_rcs_task_name(tn) is not None:
+                return f"{self._radial_rcs_segment_file_stem(tn)}.csv"
         traj_token = self._safe_filename_token(trajectory_name or self._get_current_path_name())
         target_token = self._safe_filename_token(target_name or self._get_selected_rcs_target_name())
         seg_token = f"_seg{int(segment_index):02d}" if segment_index is not None else ""
@@ -4838,15 +5198,13 @@ class MainWindow(QtWidgets.QMainWindow):
     def _resolve_rcs_save_dir(self, trajectory_name: Optional[str]) -> Path:
         """RCS 落盘目录。
 
-        星型/径向测量：同一角度会多次往返采样，为便于整理，按轨迹名(含角度)自动落到子文件夹中。
+        星型/径向测量：一次执行共用一个会话文件夹；每段 CSV 文件名为「X度第N次测量」样式（见 _format_radial_rcs_segment_label）。
         """
         base = Path(self._rcs_save_dir)
         if getattr(self, "_radial_measurement_spec", None) is not None:
-            traj = str(trajectory_name or self._get_current_path_name()).strip()
-            if traj:
-                token = self._safe_filename_token(traj)
-                if token:
-                    return base / token
+            session_dir = self._ensure_radial_rcs_session_dir()
+            if session_dir is not None:
+                return session_dir
         return base
 
     @staticmethod
@@ -5057,6 +5415,309 @@ class MainWindow(QtWidgets.QMainWindow):
             result.append(base_name)
         return result
 
+    @staticmethod
+    def _cluster_rcs_csv_slot_dx_rcs(
+        row: List[str],
+        col: Dict[str, int],
+        slot_index: int,
+    ) -> Optional[Tuple[float, float]]:
+        """读取 DX/RCS 槽位；RCS 或 DX 任一无效则跳过该槽。"""
+        dxk = f"DX{slot_index:02d}"
+        rck = f"RCS{slot_index:02d}"
+        if dxk not in col or rck not in col:
+            return None
+        try:
+            dx = MainWindow._cluster_csv_cell_float(row[col[dxk]])
+            rcs = MainWindow._cluster_csv_cell_float(row[col[rck]])
+        except (ValueError, KeyError, IndexError):
+            return None
+        if not math.isfinite(dx) or not math.isfinite(rcs):
+            return None
+        return float(dx), float(rcs)
+
+    @staticmethod
+    def _filtered_rcs_csv_path(raw_path: Path) -> Path:
+        return raw_path.with_name(f"{raw_path.stem}_Filtered.csv")
+
+    @staticmethod
+    def _build_filtered_rcs_rows_from_cluster_raw_path(
+        raw_path: Path,
+        calibration_db: float,
+    ) -> Tuple[List[List[str]], List[Tuple[float, float]], int]:
+        """
+        Filtered CSV 数据：
+        每帧按 abs(DX[i]-R) 取最近两个有效槽，记录 (DX, RCS+calibration)，再按 0.1m X 分箱算术平均。
+        """
+        metadata_rows: List[List[str]] = []
+        bins: Dict[int, List[float]] = defaultdict(list)
+        selected_count = 0
+        with raw_path.open(encoding="utf-8-sig", newline="") as f:
+            reader = csv.reader(f)
+            header_cells: Optional[List[str]] = None
+            col: Dict[str, int] = {}
+            for row in reader:
+                if row and row[0].strip() == "Time" and any(
+                    (c or "").strip() == "DX00" for c in row
+                ):
+                    header_cells = [(c or "").strip() for c in row]
+                    col = {name: idx for idx, name in enumerate(header_cells)}
+                    break
+                metadata_rows.append(list(row))
+            if not header_cells:
+                raise ValueError("Cluster RCS CSV：未找到表头行（含 Time、DX00）")
+            for k in ("R", "DX00", "RCS00"):
+                if k not in col:
+                    raise ValueError(f"Cluster RCS CSV 缺少列「{k}」")
+            max_ix = max(col.values())
+
+            for raw_row in reader:
+                if not raw_row or not any(str(c).strip() for c in raw_row):
+                    continue
+                row = list(raw_row)
+                while len(row) <= max_ix:
+                    row.append("")
+                try:
+                    range_val = MainWindow._cluster_csv_cell_float(row[col["R"]])
+                except (ValueError, KeyError, IndexError):
+                    continue
+                if not math.isfinite(range_val):
+                    continue
+
+                candidates: List[Tuple[float, int, float, float]] = []
+                for slot in range(int(MAX_CLUSTERS)):
+                    parsed = MainWindow._cluster_rcs_csv_slot_dx_rcs(row, col, slot)
+                    if parsed is None:
+                        continue
+                    dx, rcs = parsed
+                    candidates.append(
+                        (abs(float(dx) - float(range_val)), int(slot), float(dx), float(rcs))
+                    )
+                if not candidates:
+                    continue
+
+                candidates.sort(key=lambda item: (float(item[0]), int(item[1])))
+                for _dist_err, _slot, dx, rcs in candidates[:2]:
+                    bin_id = int(round(float(dx) * 10.0))
+                    bins[bin_id].append(float(rcs) + float(calibration_db))
+                    selected_count += 1
+
+        if not bins:
+            raise ValueError("Cluster RCS CSV 中没有可生成 Filtered 的有效帧")
+
+        rows: List[Tuple[float, float]] = []
+        for bin_id in range(min(bins.keys()), max(bins.keys()) + 1):
+            values = bins.get(int(bin_id), [])
+            r_val = float(bin_id) / 10.0
+            if values:
+                rows.append((r_val, float(sum(values)) / float(len(values))))
+            else:
+                rows.append((r_val, float("nan")))
+        return metadata_rows, rows, selected_count
+
+    @staticmethod
+    def _prepare_rcs_two_column_metadata(
+        metadata_rows: List[List[str]],
+        output_path: Path,
+        calibration_db: float,
+    ) -> List[List[str]]:
+        rows = [list(r) for r in metadata_rows]
+        saw_data_file = False
+        saw_calibration = False
+        for row in rows:
+            if not row:
+                continue
+            key = str(row[0] or "").strip().casefold()
+            if key == "data file":
+                while len(row) < 2:
+                    row.append("")
+                row[1] = str(output_path)
+                saw_data_file = True
+            elif key == "calibration":
+                while len(row) < 2:
+                    row.append("")
+                row[1] = format_cluster_csv_calibration(calibration_db)
+                saw_calibration = True
+
+        insert_at = next(
+            (
+                i
+                for i, row in enumerate(rows)
+                if not row or not any(str(c).strip() for c in row)
+            ),
+            len(rows),
+        )
+        if not saw_data_file:
+            rows.insert(insert_at, ["Data File", str(output_path)])
+            insert_at += 1
+        if not saw_calibration:
+            rows.insert(insert_at, ["Calibration", format_cluster_csv_calibration(calibration_db)])
+
+        if rows and any(str(c).strip() for c in rows[-1]):
+            rows.append([])
+        elif not rows:
+            rows.append([])
+        return rows
+
+    @staticmethod
+    def _write_rcs_two_column_csv(
+        output_path: Path,
+        metadata_rows: List[List[str]],
+        columns: Tuple[str, str],
+        rows: List[Tuple[float, float]],
+        *,
+        calibration_db: float,
+        include_nan_rcs: bool,
+        x_decimals: int,
+    ) -> None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        meta = MainWindow._prepare_rcs_two_column_metadata(
+            metadata_rows, output_path, calibration_db
+        )
+        with output_path.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            for row in meta:
+                w.writerow(row)
+            w.writerow(list(columns))
+            for x_val, rcs_val in rows:
+                if not math.isfinite(float(x_val)):
+                    continue
+                if not math.isfinite(float(rcs_val)):
+                    if not include_nan_rcs:
+                        continue
+                    rcs_text = "NaN"
+                else:
+                    rcs_text = f"{float(rcs_val):.4f}"
+                w.writerow([f"{float(x_val):.{int(x_decimals)}f}", rcs_text])
+
+    @staticmethod
+    def _build_combined_rcs_rows_from_filtered_sets(
+        filtered_sets: List[List[Tuple[float, float]]],
+    ) -> List[Tuple[float, float]]:
+        by_bin: Dict[int, List[float]] = defaultdict(list)
+        for rows in filtered_sets:
+            for r_val, rcs_val in rows:
+                if not math.isfinite(float(r_val)) or not math.isfinite(float(rcs_val)):
+                    continue
+                by_bin[int(round(float(r_val) * 10.0))].append(float(rcs_val))
+        if not by_bin:
+            return []
+
+        xs: List[float] = []
+        ys: List[float] = []
+        for bin_id in sorted(by_bin.keys()):
+            vals = by_bin[int(bin_id)]
+            if not vals:
+                continue
+            xs.append(float(bin_id) / 10.0)
+            ys.append(float(sum(vals)) / float(len(vals)))
+
+        x_arr = np.asarray(xs, dtype=float)
+        y_arr = np.asarray(ys, dtype=float)
+        if y_arr.size and _peak_smooth_rcs_series is not None:
+            try:
+                y_arr = np.asarray(_peak_smooth_rcs_series(y_arr), dtype=float)
+            except Exception:
+                pass
+        out: List[Tuple[float, float]] = []
+        for x_val, y_val in zip(x_arr.tolist(), y_arr.tolist()):
+            if math.isfinite(float(x_val)) and math.isfinite(float(y_val)):
+                out.append((float(x_val), float(y_val)))
+        return out
+
+    @staticmethod
+    def _combined_rcs_csv_path(raw_paths: List[Path]) -> Optional[Path]:
+        paths = [Path(p) for p in raw_paths if str(p).strip()]
+        if not paths:
+            return None
+        first = paths[0]
+        if len(paths) == 1:
+            return first.with_name(f"{first.stem}_combined.csv")
+        source_key = "\n".join(
+            str(p.resolve()) if p.exists() else str(p) for p in paths
+        )
+        digest = hashlib.sha1(source_key.encode("utf-8")).hexdigest()[:8]
+        return first.with_name(f"{first.stem}_combined_{len(paths)}files_{digest}.csv")
+
+    def _export_rcs_filtered_and_combined_csvs(
+        self,
+        file_paths: List[str],
+        calibration_db: float,
+        combined_rows_override: Optional[List[Tuple[float, float]]] = None,
+    ) -> Tuple[List[Path], Optional[Path]]:
+        filtered_paths: List[Path] = []
+        filtered_sets: List[List[Tuple[float, float]]] = []
+        combined_metadata: Optional[List[List[str]]] = None
+        raw_paths: List[Path] = []
+
+        for file_path in file_paths:
+            raw_path = Path(file_path)
+            raw_paths.append(raw_path)
+            metadata_rows, filtered_rows, _selected_count = (
+                MainWindow._build_filtered_rcs_rows_from_cluster_raw_path(
+                    raw_path, calibration_db
+                )
+            )
+            filtered_path = MainWindow._filtered_rcs_csv_path(raw_path)
+            MainWindow._write_rcs_two_column_csv(
+                filtered_path,
+                metadata_rows,
+                ("X", "RCS"),
+                filtered_rows,
+                calibration_db=calibration_db,
+                include_nan_rcs=True,
+                x_decimals=1,
+            )
+            filtered_paths.append(filtered_path)
+            filtered_sets.append(filtered_rows)
+            if combined_metadata is None:
+                combined_metadata = metadata_rows
+
+        combined_rows = (
+            list(combined_rows_override)
+            if combined_rows_override is not None
+            else MainWindow._build_combined_rcs_rows_from_filtered_sets(filtered_sets)
+        )
+        combined_path: Optional[Path] = None
+        if combined_metadata is not None:
+            combined_path = MainWindow._combined_rcs_csv_path(raw_paths)
+        if combined_path is not None:
+            MainWindow._write_rcs_two_column_csv(
+                combined_path,
+                combined_metadata,
+                ("X", "RCS"),
+                combined_rows,
+                calibration_db=calibration_db,
+                include_nan_rcs=False,
+                x_decimals=1,
+            )
+        return filtered_paths, combined_path
+
+    def _try_export_rcs_curve_csvs(
+        self,
+        file_paths: List[str],
+        calibration_db: float,
+    ) -> Tuple[List[Path], Optional[Path]]:
+        try:
+            green_rows = self._current_distance_rcs_green_curve_rows()
+            filtered_paths, combined_path = self._export_rcs_filtered_and_combined_csvs(
+                file_paths,
+                calibration_db,
+                combined_rows_override=green_rows if green_rows else None,
+            )
+        except Exception as exc:
+            self._log(f"RCS曲线CSV生成失败: {exc}")
+            QtWidgets.QMessageBox.warning(self, "RCS曲线CSV生成失败", str(exc))
+            return [], None
+        filtered_preview = ", ".join(p.name for p in filtered_paths[:4])
+        if len(filtered_paths) > 4:
+            filtered_preview += ", ..."
+        self._log(
+            "RCS曲线CSV已生成: "
+            f"Filtered={filtered_preview or '无'}"
+            + (f" | combined={combined_path}" if combined_path else "")
+        )
+        return filtered_paths, combined_path
+
     def _build_loaded_rcs_curve(
         self,
         file_path: str,
@@ -5095,9 +5756,8 @@ class MainWindow(QtWidgets.QMainWindow):
         merged_run_labels: List[int] = []
         run_base = 1
         for p in paths:
-            head_lines = Path(p).read_text(encoding="utf-8-sig").splitlines()[:8]
-            if any(str(ln).strip().startswith(ORBIT_RCS_FILE_MAGIC) for ln in head_lines):
-                raise ValueError("合并拟合仅支持距离-RCS（Cluster CSV 等），不支持 orbit_rcs 文件")
+            if MainWindow._is_orbit_rcs_polar_csv(Path(p)) or MainWindow._is_orbit_cluster_raw_csv(Path(p)):
+                raise ValueError("合并拟合仅支持距离-RCS，不支持圆周-RCS 数据")
             segs, _ = self._parse_saved_rcs_raw_file(p)
             merged_segments.extend(segs)
             merged_run_labels.extend(list(range(run_base, run_base + len(segs))))
@@ -5152,6 +5812,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._rcs_active_path_name = None
         self._rcs_active_target_name = None
         self._loaded_rcs_curves = loaded_curves if len(loaded_curves) > 1 else []
+        self._rcs_curve_csv_source_paths = list(resolved_paths)
 
         if len(loaded_curves) == 1:
             curve = loaded_curves[0]
@@ -5313,8 +5974,162 @@ class MainWindow(QtWidgets.QMainWindow):
         return (float(dx), float(dy), float(rcs))
 
     @staticmethod
-    def _parse_cluster_rcs_csv(path: Path) -> Tuple[List[List[CurvePoint]], List[int]]:
-        """Cluster 0x701 落盘 CSV：每帧一行。若 RCS01 同时有效，与 RCS00 按功率线性叠加合并为整体 RCS；几何取两簇位置平均。"""
+    def _cluster_rcs_curve_point_from_slot(
+        t_val: float,
+        seg_key: int,
+        x_raw: float,
+        y_raw: float,
+        rcs_val: float,
+    ) -> Tuple[int, CurvePoint]:
+        r_slant = float(math.hypot(x_raw, y_raw))
+        return (
+            int(seg_key),
+            CurvePoint(
+                t=float(t_val),
+                x_raw=float(x_raw),
+                y_raw=float(y_raw),
+                r_raw=float(r_slant),
+                x=float(x_raw),
+                y=float(y_raw),
+                rcs_raw=float(rcs_val),
+                rcs_filt=float(rcs_val),
+            ),
+        )
+
+    @staticmethod
+    def _cluster_rcs_rowwise_rcs00_rcs01_linear_power(
+        row: List[str],
+        col: Dict[str, int],
+        t_val: float,
+        seg_key: int,
+    ) -> List[Tuple[int, CurvePoint]]:
+        """
+        与 DRI `dri_pipeline_gui._rowwise_linear_power_rcs_db(merge_rcs01=True)` 一致：
+        同采样行内 RCS_eff = 10*log10(10^(RCS00/10)+10^(RCS01/10))；几何用主簇 DX00/DY00。
+        若仅单槽有效则退化为该槽一点。
+        """
+        s0 = MainWindow._parse_cluster_rcs_csv_row_slots(row, col, 0)
+        s1 = MainWindow._parse_cluster_rcs_csv_row_slots(row, col, 1)
+        out: List[Tuple[int, CurvePoint]] = []
+        if s0 is not None and s1 is not None:
+            x0, y0, r0 = float(s0[0]), float(s0[1]), float(s0[2])
+            _x1, _y1, r1 = float(s1[0]), float(s1[1]), float(s1[2])
+            if all(math.isfinite(v) for v in (x0, y0, r0, r1)):
+                if combine_rcs_db_incoherent_sum is not None:
+                    rcs_m = combine_rcs_db_incoherent_sum([r0, r1])
+                else:
+                    psum = 10.0 ** (r0 / 10.0) + 10.0 ** (r1 / 10.0)
+                    rcs_m = float(10.0 * math.log10(max(psum, 1e-300)))
+                if rcs_m is None or not math.isfinite(rcs_m):
+                    rcs_m = r0
+                out.append(
+                    MainWindow._cluster_rcs_curve_point_from_slot(
+                        t_val, seg_key, x0, y0, float(rcs_m)
+                    )
+                )
+                return out
+        if s0 is not None:
+            x0, y0, r0 = float(s0[0]), float(s0[1]), float(s0[2])
+            if all(math.isfinite(v) for v in (x0, y0, r0)):
+                out.append(
+                    MainWindow._cluster_rcs_curve_point_from_slot(t_val, seg_key, x0, y0, r0)
+                )
+                return out
+        if s1 is not None:
+            x1, y1, r1 = float(s1[0]), float(s1[1]), float(s1[2])
+            if all(math.isfinite(v) for v in (x1, y1, r1)):
+                out.append(
+                    MainWindow._cluster_rcs_curve_point_from_slot(t_val, seg_key, x1, y1, r1)
+                )
+        return out
+
+    @staticmethod
+    def _cluster_rcs_point_with_t(p: CurvePoint, t_new: float) -> CurvePoint:
+        return CurvePoint(
+            t=float(t_new),
+            x_raw=float(p.x_raw),
+            y_raw=float(p.y_raw),
+            r_raw=float(p.r_raw),
+            x=float(p.x),
+            y=float(p.y),
+            rcs_raw=float(p.rcs_raw),
+            rcs_filt=float(p.rcs_filt),
+        )
+
+    @staticmethod
+    def _cluster_rcs_points_time_relative(points: List[CurvePoint]) -> List[CurvePoint]:
+        """与 DRI Raw 一致：段内 Time 从 0 秒起（相对首点时间）。"""
+        if not points:
+            return points
+        t0 = float(points[0].t)
+        return [
+            MainWindow._cluster_rcs_point_with_t(p, float(p.t) - t0) for p in points
+        ]
+
+    @staticmethod
+    def _cluster_rcs_points_drop_spatial_spikes(
+        points: List[CurvePoint],
+        max_dist_step_m: float,
+        time_gap_reset_s: float,
+    ) -> List[CurvePoint]:
+        """
+        剔除相邻帧间首目标几何突变点（如 DX/DY 对应 x 方向巨跳）。
+        时间间隔 ≥ time_gap_reset_s 时视为新一段，不与前一点比幅值。
+        """
+        if len(points) <= 1:
+            return list(points)
+        out: List[CurvePoint] = [points[0]]
+        last = points[0]
+        for p in points[1:]:
+            dt = float(p.t) - float(last.t)
+            if not math.isfinite(dt):
+                continue
+            # 同一时间戳的多槽位（RCS00/RCS01/…）几何可相距较远，不得按「帧间突变」剔除
+            if abs(dt) < 1e-9:
+                out.append(p)
+                last = p
+                continue
+            if dt >= float(time_gap_reset_s):
+                out.append(p)
+                last = p
+                continue
+            dist = math.hypot(
+                float(p.x_raw) - float(last.x_raw),
+                float(p.y_raw) - float(last.y_raw),
+            )
+            if dist <= float(max_dist_step_m):
+                out.append(p)
+                last = p
+        return out
+
+    @staticmethod
+    def _finalize_cluster_rcs_curve_points(
+        points: List[CurvePoint],
+    ) -> List[CurvePoint]:
+        """排序 → 去空间突变 → 相对时间（DRI 风格）。"""
+        if not points:
+            return points
+        pts = sorted(points, key=lambda p: (float(p.t), float(p.x_raw)))
+        pts = MainWindow._cluster_rcs_points_drop_spatial_spikes(
+            pts,
+            CLUSTER_RCS_PARSE_MAX_DIST_STEP_M,
+            CLUSTER_RCS_PARSE_TIME_GAP_RESET_S,
+        )
+        return MainWindow._cluster_rcs_points_time_relative(pts)
+
+    @staticmethod
+    def _parse_cluster_rcs_csv(
+        path: Path,
+        *,
+        merge_rcs00_rcs01_rowwise: bool = True,
+        orbit_row_primary_only: bool = False,
+    ) -> Tuple[List[List[CurvePoint]], List[int]]:
+        """Cluster 0x701 落盘 CSV：每帧一行多槽位 DXii/DYii/RCSii。
+        - merge_rcs00_rcs01_rowwise=True（默认）：与 DRI `dri_pipeline_gui._rowwise_linear_power_rcs_db`
+          一致，同采样行 RCS00+RCS01 线性功率合成后只生成一点（几何取 DX00/DY00）；槽位 02 起仍逐点展开。
+        - orbit_row_primary_only=True：仅保留每帧上述行内合并点（忽略 02+ 槽），供圆周-RCS 按时间平铺绘图。
+        - merge_rcs00_rcs01_rowwise=False：每槽位各一点（旧行为）。
+        整理：剔除首目标平面位置突变帧，Time 归一为段内相对秒。"""
         tagged: List[Tuple[int, CurvePoint]] = []
         with path.open(encoding="utf-8-sig", newline="") as f:
             reader = csv.reader(f)
@@ -5349,58 +6164,55 @@ class MainWindow(QtWidgets.QMainWindow):
                 if not math.isfinite(t_val):
                     continue
 
-                s0 = MainWindow._parse_cluster_rcs_csv_row_slots(row, col, 0)
-                s1 = MainWindow._parse_cluster_rcs_csv_row_slots(row, col, 1)
-                if s0 is None and s1 is None:
-                    continue
-                if s0 is not None and s1 is not None:
-                    if combine_rcs_db_incoherent_sum is None:
-                        rcs_val = float(
-                            10.0
-                            * math.log10(
-                                10.0 ** (s0[2] / 10.0) + 10.0 ** (s1[2] / 10.0)
-                            )
-                        )
-                    else:
-                        cr = combine_rcs_db_incoherent_sum([s0[2], s1[2]])
-                        if cr is None:
-                            continue
-                        rcs_val = float(cr)
-                    x_raw = (s0[0] + s1[0]) * 0.5
-                    y_raw = (s0[1] + s1[1]) * 0.5
-                elif s0 is not None:
-                    x_raw, y_raw, rcs_val = s0[0], s0[1], s0[2]
-                else:
-                    x_raw, y_raw, rcs_val = s1[0], s1[1], s1[2]
-
-                if not all(math.isfinite(v) for v in (x_raw, y_raw, rcs_val)):
-                    continue
-                r_slant = float(math.hypot(x_raw, y_raw))
                 seg_key = 0
                 if use_seg:
                     try:
                         seg_key = int(round(float(MainWindow._cluster_csv_cell_float(row[col["SegIdx"]]))))
                     except (ValueError, OverflowError):
                         seg_key = 0
-                tagged.append(
-                    (
-                        seg_key,
-                        CurvePoint(
-                            t=float(t_val),
-                            x_raw=float(x_raw),
-                            y_raw=float(y_raw),
-                            r_raw=float(r_slant),
-                            x=float(x_raw),
-                            y=float(y_raw),
-                            rcs_raw=float(rcs_val),
-                            rcs_filt=float(rcs_val),
-                        ),
+
+                row_any = False
+                if merge_rcs00_rcs01_rowwise:
+                    merged01 = MainWindow._cluster_rcs_rowwise_rcs00_rcs01_linear_power(
+                        row, col, t_val, seg_key
                     )
-                )
+                    for item in merged01:
+                        tagged.append(item)
+                        row_any = True
+                    if not orbit_row_primary_only:
+                        for slot in range(2, int(MAX_CLUSTERS)):
+                            s = MainWindow._parse_cluster_rcs_csv_row_slots(row, col, slot)
+                            if s is None:
+                                continue
+                            x_raw, y_raw, rcs_val = float(s[0]), float(s[1]), float(s[2])
+                            if not all(math.isfinite(v) for v in (x_raw, y_raw, rcs_val)):
+                                continue
+                            row_any = True
+                            tagged.append(
+                                MainWindow._cluster_rcs_curve_point_from_slot(
+                                    t_val, seg_key, x_raw, y_raw, rcs_val
+                                )
+                            )
+                else:
+                    for slot in range(int(MAX_CLUSTERS)):
+                        s = MainWindow._parse_cluster_rcs_csv_row_slots(row, col, slot)
+                        if s is None:
+                            continue
+                        x_raw, y_raw, rcs_val = float(s[0]), float(s[1]), float(s[2])
+                        if not all(math.isfinite(v) for v in (x_raw, y_raw, rcs_val)):
+                            continue
+                        row_any = True
+                        tagged.append(
+                            MainWindow._cluster_rcs_curve_point_from_slot(
+                                t_val, seg_key, x_raw, y_raw, rcs_val
+                            )
+                        )
+                if not row_any:
+                    continue
 
         if not tagged:
             raise ValueError(
-                "Cluster RCS CSV 中没有可用的簇点（至少需要 DX00/DY00/RCS00 或 DX01/DY01/RCS01 有效组合）"
+                "Cluster RCS CSV 中没有可用的簇点（至少需要某一槽位 DXii/DYii/RCSii 均为有限值）"
             )
 
         if use_seg:
@@ -5411,23 +6223,75 @@ class MainWindow(QtWidgets.QMainWindow):
             segments: List[List[CurvePoint]] = []
             segment_run_labels: List[int] = []
             for run_i, sk in enumerate(sorted_keys, start=1):
-                pts = sorted(by_seg[sk], key=lambda p: float(p.t))
+                pts = sorted(by_seg[sk], key=lambda p: (float(p.t), float(p.x_raw)))
                 if pts:
-                    segments.append(pts)
+                    segments.append(MainWindow._finalize_cluster_rcs_curve_points(pts))
                     segment_run_labels.append(run_i)
             if not segments:
                 raise ValueError("Cluster RCS CSV 中没有有效的分段数据")
             return segments, segment_run_labels
 
         points = [pt for _, pt in tagged]
-        points.sort(key=lambda p: float(p.t))
-        return [points], [1]
+        points.sort(key=lambda p: (float(p.t), float(p.x_raw)))
+        return [MainWindow._finalize_cluster_rcs_curve_points(points)], [1]
 
     def _parse_saved_rcs_raw_file(self, file_path: str) -> Tuple[List[List[CurvePoint]], List[int]]:
         path = Path(file_path)
         if path.suffix.lower() != ".csv":
             raise ValueError("仅支持载入 .csv 格式的 Cluster RCS 数据")
         return MainWindow._parse_cluster_rcs_csv(path)
+
+    def _orbit_plot_rows_from_cluster_raw_path(self, file_path: str) -> List[Dict[str, float]]:
+        """圆周 Raw 专用：每行 RCS00+RCS01 线性功率合并后按时间平铺。
+
+        圆周图只使用时间序列与合并后的 RCS，不使用直线距离图的空间突变剔除。
+        """
+        path = Path(file_path)
+        rows: List[Dict[str, float]] = []
+        with path.open(encoding="utf-8-sig", newline="") as f:
+            reader = csv.reader(f)
+            header_cells: Optional[List[str]] = None
+            col: Dict[str, int] = {}
+            for row in reader:
+                if not row:
+                    continue
+                if row[0].strip() == "Time" and any((c or "").strip() == "DX00" for c in row):
+                    header_cells = [(c or "").strip() for c in row]
+                    col = {name: idx for idx, name in enumerate(header_cells)}
+                    break
+            if not header_cells:
+                raise ValueError("Cluster RCS CSV：未找到表头行（含 Time、DX00）")
+            for k in ("Time", "DX00", "DY00", "RCS00"):
+                if k not in col:
+                    raise ValueError(f"Cluster RCS CSV 缺少列「{k}」")
+            max_ix = max(col.values())
+
+            for raw_row in reader:
+                if not raw_row or not any(str(c).strip() for c in raw_row):
+                    continue
+                row = list(raw_row)
+                while len(row) <= max_ix:
+                    row.append("")
+                try:
+                    t_val = MainWindow._cluster_csv_cell_float(row[col["Time"]])
+                except (ValueError, KeyError, IndexError):
+                    continue
+                if not math.isfinite(t_val):
+                    continue
+                merged = MainWindow._cluster_rcs_rowwise_rcs00_rcs01_linear_power(
+                    row, col, float(t_val), 0
+                )
+                if not merged:
+                    continue
+                pt = merged[0][1]
+                rcs_f = float(pt.rcs_filt)
+                if not math.isfinite(rcs_f):
+                    continue
+                rows.append({"t": float(t_val), "rcs_filt": rcs_f})
+        if not rows:
+            raise ValueError("Cluster RCS CSV 中没有可用于圆周绘图的 RCS00/RCS01 数据")
+        rows.sort(key=lambda r: float(r["t"]))
+        return rows
 
     def _on_plot_saved_rcs_clicked(self) -> None:
         # Repurposed per request: "导入数据对比"
@@ -5859,14 +6723,6 @@ class MainWindow(QtWidgets.QMainWindow):
             return f"{self._get_rcs_title()} | Orbit RCS"
         return self._get_rcs_title()
 
-        if compact:
-            if plot_mode == "orbit":
-                return "鍦嗗懆 RCS"
-            return "RCS 瀵规瘮" if self._loaded_rcs_curves else "RCS"
-        if plot_mode == "orbit":
-            return f"{self._get_rcs_title()} | 鍦嗗懆-RCS"
-        return self._get_rcs_title()
-
     def _create_rcs_export_figure(self) -> Figure:
         plot_mode = self._get_rcs_plot_mode()
         # 导出图片固定为 1:1（正方形），避免保存时长宽比变化
@@ -5885,6 +6741,165 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         fig.tight_layout(pad=1.1)
         return fig
+
+    @staticmethod
+    def _ema_smooth_rcs_array(y: np.ndarray, alpha: float) -> np.ndarray:
+        y = np.asarray(y, dtype=float)
+        if y.size <= 1:
+            return y.copy()
+        a = float(alpha)
+        if not np.isfinite(a) or a <= 0.0 or a >= 1.0:
+            return y.copy()
+        out = np.empty_like(y, dtype=float)
+        out[0] = float(y[0])
+        for i in range(1, int(y.size)):
+            out[i] = a * float(y[i]) + (1.0 - a) * float(out[i - 1])
+        return out
+
+    @staticmethod
+    def _bin_rcs_curve_points_for_plot(points: List[CurvePoint]) -> Tuple[np.ndarray, np.ndarray]:
+        """与距离-RCS图中每次测量曲线一致：0.1m 分箱、同周期功率合并、RCS跳变剔除、平滑。"""
+        if not points:
+            return np.asarray([], dtype=float), np.asarray([], dtype=float)
+        xs = np.asarray([float(p.x) for p in points], dtype=float)
+        ys = np.asarray([float(p.rcs_filt) for p in points], dtype=float)
+        ts = np.asarray([float(p.t) for p in points], dtype=float)
+        mask = np.isfinite(xs) & np.isfinite(ys) & np.isfinite(ts)
+        mask &= (xs >= float(RCS_STRAIGHT_X_MIN_M)) & (xs <= float(RCS_STRAIGHT_X_MAX_M))
+        xs = xs[mask]
+        ys = ys[mask]
+        ts = ts[mask]
+        if xs.size == 0:
+            return np.asarray([], dtype=float), np.asarray([], dtype=float)
+
+        order0 = np.argsort(xs)
+        xs = xs[order0]
+        ys = ys[order0]
+        ts = ts[order0]
+        if xs.size >= 2:
+            keep = np.ones(xs.size, dtype=bool)
+            last_idx = 0
+            for j in range(1, xs.size):
+                if not keep[last_idx]:
+                    last_idx = j
+                    continue
+                if abs(float(ys[j]) - float(ys[last_idx])) > 10.0:
+                    keep[j] = False
+                else:
+                    last_idx = j
+            xs = xs[keep]
+            ys = ys[keep]
+            ts = ts[keep]
+            if xs.size == 0:
+                return np.asarray([], dtype=float), np.asarray([], dtype=float)
+
+        bin_m = 0.1
+        bin_ids = np.floor(xs / float(bin_m)).astype(np.int64)
+        uniq = np.unique(bin_ids)
+        xb: List[float] = []
+        yb: List[float] = []
+        t_gate = float(RCS_BIN_INCOHERENT_SUM_MAX_TIME_SPAN_S)
+        for bid in uniq:
+            m = bin_ids == bid
+            if not np.any(m):
+                continue
+            xb.append(float(np.mean(xs[m])))
+            ys_b = ys[m]
+            ts_b = ts[m]
+            if ys_b.size <= 1:
+                yb.append(float(ys_b[0]))
+            elif float(np.max(ts_b) - np.min(ts_b)) <= t_gate:
+                if combine_rcs_db_incoherent_sum is not None:
+                    cr = combine_rcs_db_incoherent_sum(ys_b.tolist())
+                    yb.append(float(cr) if cr is not None else float(np.mean(ys_b)))
+                else:
+                    yb.append(
+                        float(
+                            10.0
+                            * math.log10(float(np.sum(10.0 ** (ys_b.astype(float) / 10.0))))
+                        )
+                    )
+            else:
+                yb.append(float(np.mean(ys_b)))
+        x_out = np.asarray(xb, dtype=float)
+        y_out = np.asarray(yb, dtype=float)
+        order = np.argsort(x_out)
+        x_out = x_out[order]
+        y_out = y_out[order]
+        if _peak_smooth_rcs_series is not None:
+            y_out = np.asarray(_peak_smooth_rcs_series(y_out), dtype=float)
+        else:
+            y_out = MainWindow._ema_smooth_rcs_array(y_out, float(RCS_STRAIGHT_EMA_ALPHA))
+        return x_out, y_out
+
+    def _current_distance_rcs_green_curve_rows(self) -> List[Tuple[float, float]]:
+        """返回当前距离-RCS图绿色融合曲线的 X/RCS 点；无绿色曲线时返回空列表。"""
+        if self._get_rcs_plot_mode() != "distance" or getattr(self, "_loaded_rcs_curves", []):
+            return []
+        recorder = getattr(self, "rcs_recorder", None)
+        segments = list(getattr(recorder, "segments", []) or [])
+        if not segments:
+            return []
+
+        per_run_binned: List[Tuple[np.ndarray, np.ndarray]] = []
+        for seg in segments[:30]:
+            xb, yb = MainWindow._bin_rcs_curve_points_for_plot(list(seg))
+            yb = self._apply_rcs_plot_calibration_to_y(yb)
+            if xb.size == 0 or yb.size == 0:
+                continue
+            per_run_binned.append((np.asarray(xb, dtype=float), np.asarray(yb, dtype=float)))
+        if not per_run_binned:
+            return []
+
+        bin_m = 0.1
+        thr_db = 10.0
+        bin_to_xs: Dict[int, List[float]] = {}
+        bin_to_ys: Dict[int, List[float]] = {}
+        for xb, yb in per_run_binned:
+            n = min(int(xb.size), int(yb.size))
+            xb2 = np.asarray(xb[:n], dtype=float)
+            yb2 = np.asarray(yb[:n], dtype=float)
+            m2 = np.isfinite(xb2) & np.isfinite(yb2)
+            xb2 = xb2[m2]
+            yb2 = yb2[m2]
+            if xb2.size == 0:
+                continue
+            bids = np.floor(xb2 / float(bin_m)).astype(np.int64)
+            for k, xk, yk in zip(bids.tolist(), xb2.tolist(), yb2.tolist()):
+                bin_to_xs.setdefault(int(k), []).append(float(xk))
+                bin_to_ys.setdefault(int(k), []).append(float(yk))
+
+        xb_all: List[float] = []
+        yb_all: List[float] = []
+        for bid in sorted(bin_to_ys.keys()):
+            ys_list = bin_to_ys.get(int(bid), [])
+            xs_list = bin_to_xs.get(int(bid), [])
+            if not ys_list or not xs_list:
+                continue
+            ys_arr = np.asarray(ys_list, dtype=float)
+            xs_arr = np.asarray(xs_list, dtype=float)
+            med = float(np.median(ys_arr))
+            keep = np.abs(ys_arr - med) <= float(thr_db)
+            if not np.any(keep):
+                continue
+            xb_all.append(float(np.mean(xs_arr[keep])))
+            yb_all.append(float(np.mean(ys_arr[keep])))
+        if not xb_all:
+            return []
+        x_arr = np.asarray(xb_all, dtype=float)
+        y_arr = np.asarray(yb_all, dtype=float)
+        order_all = np.argsort(x_arr)
+        x_arr = x_arr[order_all]
+        y_arr = y_arr[order_all]
+        if _peak_smooth_rcs_series is not None:
+            y_arr = np.asarray(_peak_smooth_rcs_series(y_arr), dtype=float)
+        else:
+            y_arr = MainWindow._ema_smooth_rcs_array(y_arr, float(RCS_STRAIGHT_EMA_ALPHA))
+        out: List[Tuple[float, float]] = []
+        for x_val, y_val in zip(x_arr.tolist(), y_arr.tolist()):
+            if math.isfinite(float(x_val)) and math.isfinite(float(y_val)):
+                out.append((float(x_val), float(y_val)))
+        return out
 
     def _render_rcs_plot_on_axis(
         self,
@@ -5921,7 +6936,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 ax.text(
                     0.5,
                     0.5,
-                    "暂无圆周RCS数据\n圆弧段勾选RCS并跑完轨迹后会自动保存；\n或选择 orbit_rcs 数据文件",
+                    "暂无圆周RCS数据\n圆弧段勾选RCS并跑完轨迹后，仅用 Cluster Raw 落盘；\n"
+                    "载入同目录 Raw 或切换「圆周-RCS」查看（按时间平铺后角度分箱均值）。\n"
+                    "历史 __orbit_rcs__*.csv 仍可载入。",
                     transform=ax.transAxes,
                     ha="center",
                     va="center",
@@ -5932,41 +6949,84 @@ class MainWindow(QtWidgets.QMainWindow):
 
             angles = np.asarray(series["angles"], dtype=float)
             values = self._apply_rcs_plot_calibration_to_y(np.asarray(series["values"], dtype=float))
-            orbit_mode = str(series.get("mode", "legacy_scaled"))
+            fit_angles = np.asarray(series.get("fit_angles", []), dtype=float)
+            fit_values = self._apply_rcs_plot_calibration_to_y(
+                np.asarray(series.get("fit_values", []), dtype=float)
+            )
+            orbit_mode = str(series.get("mode", "abs_dbsm"))
             abs_dbsm = orbit_mode == "abs_dbsm"
 
             if abs_dbsm:
-                # 标定后按当前 RCS 重算径向平移与刻度（与 _build_orbit_polar_series_from_rows 一致）
+                # 标定后按当前 RCS 重算径向平移与刻度，保持半径刻度显示真实 dBsm。
                 rmin = float(np.min(values)) if values.size else 0.0
                 rmax = float(np.max(values)) if values.size else 0.0
-                span_v = rmax - rmin
-                pad = max(
-                    0.5,
-                    0.02 * (span_v if span_v > 1e-6 else max(abs(rmin), 1.0) * 0.02 + 1.0),
+                tick_step = max(float(series.get("radial_tick_step_db", ORBIT_RCS_RADIAL_TICK_STEP_DB)), 1e-6)
+                tick_start = math.floor(rmin / tick_step) * tick_step
+                tick_end = math.ceil(rmax / tick_step) * tick_step
+                if tick_end <= tick_start:
+                    tick_end = tick_start + tick_step
+                tick_values = np.arange(
+                    tick_start,
+                    tick_end + tick_step * 0.5,
+                    tick_step,
+                    dtype=float,
                 )
-                floor = rmin - pad
+                floor = tick_start - max(0.5, tick_step * 0.1)
                 radii = values - floor if values.size else np.asarray([], dtype=float)
-                tick_count = 5
-                if span_v <= 1e-9:
-                    tick_values = np.linspace(rmin, rmin + 1.0, tick_count)
-                else:
-                    tick_values = np.linspace(rmin, rmax, tick_count)
+                fit_radii = fit_values - floor if fit_values.size else np.asarray([], dtype=float)
                 tick_positions = tick_values - floor
             else:
                 radii = np.asarray(series["radii"], dtype=float)
+                fit_radii = np.asarray(series.get("fit_radii", []), dtype=float)
                 tick_positions = np.asarray(series["tick_positions"], dtype=float)
-                tick_values = self._apply_rcs_plot_calibration_to_y(np.asarray(series["tick_values"], dtype=float))
+                tick_values = self._apply_rcs_plot_calibration_to_y(
+                    np.asarray(series["tick_values"], dtype=float)
+                )
 
-            if compact:
+            if compact and not abs_dbsm:
                 tick_positions, tick_values = self._thin_rcs_tick_labels(
                     tick_positions,
                     tick_values,
                     3,
                 )
 
-            if angles.size >= 2:
+            plotted_mean_curve = False
+            if fit_angles.size >= 2 and fit_radii.size == fit_angles.size:
+                curve_angles = np.asarray(fit_angles, dtype=float)
+                curve_radii = np.asarray(fit_radii, dtype=float)
+                finite_curve = np.isfinite(curve_angles) & np.isfinite(curve_radii)
+                curve_angles = curve_angles[finite_curve]
+                curve_radii = curve_radii[finite_curve]
+                if curve_angles.size >= 2:
+                    if curve_angles.size >= 3:
+                        curve_angles = np.concatenate(
+                            [curve_angles, np.asarray([2.0 * math.pi], dtype=float)]
+                        )
+                        curve_radii = np.concatenate(
+                            [curve_radii, np.asarray([float(curve_radii[0])], dtype=float)]
+                        )
+                    ax.plot(
+                        curve_angles,
+                        curve_radii,
+                        "-",
+                        color="#1565C0",
+                        linewidth=2.25 if export else 1.65,
+                        alpha=0.98,
+                        zorder=4,
+                        label="角度分箱均值",
+                    )
+                    if export and curve_angles.size >= 3:
+                        ax.fill(
+                            curve_angles,
+                            curve_radii,
+                            color="#90CAF9",
+                            alpha=0.12,
+                            zorder=1,
+                        )
+                    plotted_mean_curve = True
+
+            if not plotted_mean_curve and angles.size >= 2:
                 if abs_dbsm:
-                    # 按时间顺序展开的极角：折线连接各采样点
                     ax.plot(
                         angles,
                         radii,
@@ -5977,10 +7037,13 @@ class MainWindow(QtWidgets.QMainWindow):
                         zorder=2,
                     )
                 else:
-                    # 按几何角排序的 legacy：彩色线段 + 填充
                     pts = np.column_stack([angles, radii]).astype(float)
                     segs = np.stack([pts[:-1], pts[1:]], axis=1)
-                    seg_values = 0.5 * (values[:-1] + values[1:]) if values.size == angles.size else values[:-1]
+                    seg_values = (
+                        0.5 * (values[:-1] + values[1:])
+                        if values.size == angles.size
+                        else values[:-1]
+                    )
                     lc = LineCollection(
                         segs,
                         cmap="turbo",
@@ -6026,19 +7089,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 tick_fmt = "{:.1f}" if export else "{:.0f}"
                 ax.set_yticklabels([tick_fmt.format(val) for val in tick_values])
             ax.set_ylim(0.0, max(r_cap, float(np.max(radii)) * 1.05) if radii.size else r_cap)
-
             if export:
-                if abs_dbsm and not bool(series.get("orbit_angle_by_time")):
-                    ax.text(
-                        0.02,
-                        1.04,
-                        f"角度范围 {float(series.get('span_deg', 0.0)):.0f}° | 径向=RCS (dBsm)",
-                        transform=ax.transAxes,
-                        ha="left",
-                        va="bottom",
-                        fontsize=10,
-                        color="#455A64",
-                    )
                 cbar = ax.figure.colorbar(scatter, ax=ax, pad=0.10, fraction=0.05)
                 cbar.set_label("RCS (dBsm)")
                 cbar.ax.tick_params(labelsize=9)
@@ -6159,15 +7210,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 return out
 
             def _bin_points_by_x(points: List[CurvePoint]) -> Tuple[np.ndarray, np.ndarray]:
-                # 0.1m 分箱：同一次测量中不同 ID 的点一并参与分箱；箱内取均值后连线
+                # 0.1m 分箱；同一雷达周期内（|Δt| 小）多反射点：RCS 按功率线性叠加
+                #   P_total = Σ 10^(RCS/10)，RCS_total = 10×log10(P_total)（与 RCS00+RCS01 一致）；
+                # 跨时间样本仍用 dB 算术均值以平滑轨迹。
                 if not points:
                     return np.asarray([], dtype=float), np.asarray([], dtype=float)
                 xs = np.asarray([float(p.x) for p in points], dtype=float)
                 ys = np.asarray([float(p.rcs_filt) for p in points], dtype=float)
-                mask = np.isfinite(xs) & np.isfinite(ys)
+                ts = np.asarray([float(p.t) for p in points], dtype=float)
+                mask = np.isfinite(xs) & np.isfinite(ys) & np.isfinite(ts)
                 mask &= (xs >= float(RCS_STRAIGHT_X_MIN_M)) & (xs <= float(RCS_STRAIGHT_X_MAX_M))
                 xs = xs[mask]
                 ys = ys[mask]
+                ts = ts[mask]
                 if xs.size == 0:
                     return np.asarray([], dtype=float), np.asarray([], dtype=float)
 
@@ -6175,6 +7230,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 order0 = np.argsort(xs)
                 xs = xs[order0]
                 ys = ys[order0]
+                ts = ts[order0]
                 if xs.size >= 2:
                     keep = np.ones(xs.size, dtype=bool)
                     last_idx = 0
@@ -6188,6 +7244,7 @@ class MainWindow(QtWidgets.QMainWindow):
                             last_idx = j
                     xs = xs[keep]
                     ys = ys[keep]
+                    ts = ts[keep]
                     if xs.size == 0:
                         return np.asarray([], dtype=float), np.asarray([], dtype=float)
 
@@ -6196,12 +7253,29 @@ class MainWindow(QtWidgets.QMainWindow):
                 uniq = np.unique(bin_ids)
                 xb: List[float] = []
                 yb: List[float] = []
+                t_gate = float(RCS_BIN_INCOHERENT_SUM_MAX_TIME_SPAN_S)
                 for bid in uniq:
                     m = bin_ids == bid
                     if not np.any(m):
                         continue
                     xb.append(float(np.mean(xs[m])))
-                    yb.append(float(np.mean(ys[m])))
+                    ys_b = ys[m]
+                    ts_b = ts[m]
+                    if ys_b.size <= 1:
+                        yb.append(float(ys_b[0]))
+                    elif float(np.max(ts_b) - np.min(ts_b)) <= t_gate:
+                        if combine_rcs_db_incoherent_sum is not None:
+                            cr = combine_rcs_db_incoherent_sum(ys_b.tolist())
+                            yb.append(float(cr) if cr is not None else float(np.mean(ys_b)))
+                        else:
+                            yb.append(
+                                float(
+                                    10.0
+                                    * math.log10(float(np.sum(10.0 ** (ys_b.astype(float) / 10.0))))
+                                )
+                            )
+                    else:
+                        yb.append(float(np.mean(ys_b)))
                 x_out = np.asarray(xb, dtype=float)
                 y_out = np.asarray(yb, dtype=float)
                 order = np.argsort(x_out)
@@ -6311,7 +7385,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     linewidth=2.8 if export else 2.2,
                     color="#2E7D32",
                     alpha=0.98 if export else 0.94,
-                    label="融合曲线(0.1m分箱)" if len(segments) > 1 else None,
+                    label="融合曲线" if len(segments) > 1 else None,
                     zorder=4,
                 )
             # 按需求：直线图不显示“次数/分箱点数”旁注，避免图片过于拥挤
@@ -6627,29 +7701,38 @@ class MainWindow(QtWidgets.QMainWindow):
         self,
         segment_index: Optional[int] = None,
         trajectory_name: Optional[str] = None,
-    ) -> None:
+    ) -> bool:
         """开始 Cluster(0x701) RCS CSV 录制。"""
         self._orbit_rcs_active = False
         self._orbit_rcs_rows.clear()
         self._orbit_polar_cached_series = None
         save_dir = str(self._resolve_rcs_save_dir(trajectory_name or self._get_current_path_name()))
-        traj_tok = self._safe_filename_token(
-            str(trajectory_name or self._get_current_path_name()).strip() or "轨迹"
-        )
-        seg_part = (
-            f"_seg{int(segment_index):02d}"
-            if segment_index is not None
-            else "_segXX"
-        )
-        stem = f"{traj_tok}_cluster{seg_part}"
-        if not self.controller.begin_cluster_rcs_capture(save_dir, stem):
+        if self._radial_measurement_spec is not None:
+            stem = self._radial_rcs_segment_file_stem(trajectory_name)
+            explicit_filename = f"{stem}.csv"
+        else:
+            traj_tok = self._safe_filename_token(
+                str(trajectory_name or self._get_current_path_name()).strip() or "轨迹"
+            )
+            seg_part = (
+                f"_seg{int(segment_index):02d}"
+                if segment_index is not None
+                else "_segXX"
+            )
+            stem = f"{traj_tok}_cluster{seg_part}"
+            explicit_filename = None
+        if not self.controller.begin_cluster_rcs_capture(
+            save_dir,
+            stem,
+            filename=explicit_filename,
+        ):
             QtWidgets.QMessageBox.warning(
                 self,
                 "Cluster RCS",
                 "无法启动 CSV：Cluster 接收未就绪或非 Linux CAN（需 can0 Cluster 模式）。",
             )
             self._log("Cluster RCS CSV 启动失败（cluster_csv_runtime 不可用）")
-            return
+            return False
         self._straight_rcs_collect_all = self._segment_index_is_forward_straight_segment(segment_index)
         self._straight_rcs_last_by_oid.clear()
         self._straight_rcs_rcs_ema_by_oid.clear()
@@ -6663,6 +7746,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._rcs_show_only_fitted = False
         self._rcs_orbit_samples = []
         self._loaded_rcs_curves = []
+        self._rcs_curve_csv_source_paths = []
         self._rcs_active_segment_index = segment_index
         self._rcs_active_path_name = str(trajectory_name or self._get_current_path_name()).strip() or "轨迹"
         self._rcs_active_target_name = self._get_live_rcs_target_name()
@@ -6678,13 +7762,18 @@ class MainWindow(QtWidgets.QMainWindow):
             f"轨迹={self._rcs_active_path_name}{segment_text} | 目录={save_dir}"
         )
         self._draw_rcs()
+        return True
 
     def _on_orbit_rcs_start(
         self,
         segment_index: Optional[int] = None,
         trajectory_name: Optional[str] = None,
     ) -> None:
-        """圆周段：Cluster CSV + 距离门内簇点写入 orbit 极坐标采样。"""
+        """
+        圆周段：落盘主文件与直线段相同，均为 DRI Raw 风格 Cluster CSV
+        （Data Type/Run Number/Calibration + Time,R,ViewAng,…,DX00..RCS19）；
+        仅横向 ROI 放宽（orbit_roi）；圆周段不再单独落盘极坐标 CSV，仅 Cluster Raw；极坐标由 Raw 重放或实时缓存绘制。
+        """
         save_dir = str(self._resolve_rcs_save_dir(trajectory_name or self._get_current_path_name()))
         traj_tok = self._safe_filename_token(
             str(trajectory_name or self._get_current_path_name()).strip() or "轨迹"
@@ -6695,7 +7784,9 @@ class MainWindow(QtWidgets.QMainWindow):
             else "_segXX"
         )
         stem = f"{traj_tok}_orbit_cluster{seg_part}"
-        if not self.controller.begin_cluster_rcs_capture(save_dir, stem):
+        if not self.controller.begin_cluster_rcs_capture(
+            save_dir, stem, orbit_roi=True
+        ):
             QtWidgets.QMessageBox.warning(
                 self,
                 "Cluster RCS",
@@ -6715,6 +7806,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._rcs_show_only_fitted = False
         self._rcs_orbit_samples = []
         self._loaded_rcs_curves = []
+        self._rcs_curve_csv_source_paths = []
         self._rcs_active_segment_index = segment_index
         self._rcs_active_path_name = str(trajectory_name or self._get_current_path_name()).strip() or "轨迹"
         self._rcs_active_target_name = self._get_live_rcs_target_name()
@@ -6728,6 +7820,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._log(
             f"【圆周 Cluster 0x701】RCS CSV 已开始 | 轨迹={self._rcs_active_path_name}{segment_text}"
         )
+        self._select_rcs_plot_mode("orbit")
         self._draw_rcs()
 
     def _finalize_orbit_rcs_recording(
@@ -6737,7 +7830,9 @@ class MainWindow(QtWidgets.QMainWindow):
         save_fit_image: bool,
         trajectory_name: Optional[str],
         segment_index: Optional[int],
+        cluster_raw_csv_path: Optional[str] = None,
     ) -> Tuple[int, Optional[str], Optional[str]]:
+        # save_raw / save_fit_image：圆周段不再另存极坐标 CSV；Cluster Raw 已在 _finalize_cluster_rcs_csv_only 落盘。
         self._orbit_rcs_active = False
         self._rcs_recording = False
         rows = list(self._orbit_rcs_rows)
@@ -6771,31 +7866,30 @@ class MainWindow(QtWidgets.QMainWindow):
             self._rcs_active_target_name = None
             self._rcs_snapshot_file_target_name = None
             self._rcs_relock_events = []
-            self.rcs_status_label.setText("圆周RCS: 已结束 | 有效点不足，未保存")
+            extra = f" | Cluster Raw: {cluster_raw_csv_path}" if cluster_raw_csv_path else ""
+            self.rcs_status_label.setText("圆周RCS: 已结束 | 预览点数不足" + extra)
             self._log(
-                f"圆周RCS结束: 轨迹={resolved_trajectory_name} | 目标={resolved_target_name} | 点数不足，未保存"
+                f"圆周RCS结束: 轨迹={resolved_trajectory_name} | 目标={resolved_target_name} | 点数不足，无极坐标预览{extra}"
             )
             self._draw_rcs()
-            return 0, None, None
+            return 0, cluster_raw_csv_path, None
 
         self._orbit_polar_cached_series = self._build_orbit_polar_series_from_rows(rows)
-        raw_path = None
-        if save_raw:
-            raw_path = self._save_orbit_rcs_file(rows, resolved_trajectory_name, resolved_target_name)
-
+        self._select_rcs_plot_mode("orbit")
+        extra = f" | Cluster Raw: {cluster_raw_csv_path}" if cluster_raw_csv_path else ""
         self.rcs_status_label.setText(
-            f"圆周RCS: 已结束 | 点数={len(rows)}"
-            + (f" | 已保存 {raw_path}" if raw_path else "")
+            f"圆周RCS: 已结束 | 预览点数={len(rows)} | 角度分箱均值曲线（仅 Raw 落盘）{extra}"
         )
         log_parts = [
             f"圆周RCS结束: 轨迹={resolved_trajectory_name}",
             f"目标={resolved_target_name}",
-            f"点数={len(rows)}",
+            f"预览点数={len(rows)}",
+            f"极坐标=时间平铺到2π后按{ORBIT_RCS_ANGLE_BIN_DEG:g}°分箱算术平均",
         ]
         if resolved_segment_index is not None:
             log_parts.append(f"分段={resolved_segment_index}")
-        if raw_path:
-            log_parts.append(f"文件={raw_path}")
+        if cluster_raw_csv_path:
+            log_parts.append(f"ClusterRaw={cluster_raw_csv_path}")
         if self._rcs_relock_events:
             log_parts.append(f"自动重锁={len(self._rcs_relock_events)}次")
         self._log(" | ".join(log_parts))
@@ -6806,7 +7900,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._rcs_snapshot_file_target_name = None
         self._rcs_relock_events = []
         self._draw_rcs()
-        return len(rows), raw_path, None
+        return len(rows), cluster_raw_csv_path, None
 
     def _finalize_cluster_rcs_csv_only(
         self,
@@ -6826,9 +7920,7 @@ class MainWindow(QtWidgets.QMainWindow):
         csv_path = self.controller.end_cluster_rcs_capture()
         self._rcs_recording = False
         self._orbit_rcs_active = False
-        if is_orbit:
-            self._orbit_rcs_rows.clear()
-            self._orbit_polar_cached_series = None
+        # 圆周段极坐标预览来自内存/Cluster Raw 重放；下次启动直线/圆周采集时在各自入口清空
         self.rcs_recorder.reset()
         self.rcs_recorder._cur = []
         self.rcs_recorder._ended = True
@@ -6873,18 +7965,29 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> Tuple[int, Optional[str], Optional[str]]:
         rt_fin = getattr(self.controller, "cluster_csv_runtime", None)
         if rt_fin is not None and rt_fin.is_recording():
-            return self._finalize_cluster_rcs_csv_only(
+            was_orbit = bool(self._orbit_rcs_active)
+            n_frames, csv_path, fit_csv = self._finalize_cluster_rcs_csv_only(
                 save_raw=save_raw,
                 trajectory_name=trajectory_name,
                 segment_index=segment_index,
-                is_orbit=bool(self._orbit_rcs_active),
+                is_orbit=was_orbit,
             )
+            if was_orbit:
+                return self._finalize_orbit_rcs_recording(
+                    save_raw=save_raw,
+                    save_fit_image=save_fit_image,
+                    trajectory_name=trajectory_name,
+                    segment_index=segment_index,
+                    cluster_raw_csv_path=csv_path,
+                )
+            return n_frames, csv_path, fit_csv
         if self._orbit_rcs_active:
             return self._finalize_orbit_rcs_recording(
                 save_raw=save_raw,
                 save_fit_image=save_fit_image,
                 trajectory_name=trajectory_name,
                 segment_index=segment_index,
+                cluster_raw_csv_path=None,
             )
         if self.rcs_recorder.oid is None and self.rcs_recorder.point_count() <= 0:
             self._rcs_recording = False
@@ -7067,6 +8170,34 @@ class MainWindow(QtWidgets.QMainWindow):
         label = self._safe_filename_token(self._get_selected_rcs_target_name())
         return f"rcs_plot_{label}_{stamp}.png"
 
+    def _current_rcs_curve_csv_source_paths(self) -> List[str]:
+        """当前距离-RCS图对应的 Raw CSV；保存图片时同步生成 Filtered/combined。"""
+        if self._get_rcs_plot_mode() != "distance":
+            return []
+        candidates = list(getattr(self, "_rcs_curve_csv_source_paths", []) or [])
+        if not candidates:
+            if self._loaded_rcs_curves:
+                candidates = [str(curve.file_path) for curve in self._loaded_rcs_curves]
+            elif self._rcs_base_file_path:
+                candidates = [str(self._rcs_base_file_path)]
+
+        out: List[str] = []
+        seen: Set[str] = set()
+        for raw in candidates:
+            path = Path(str(raw))
+            key = str(path.resolve()) if path.exists() else str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            if not path.is_file() or path.suffix.lower() != ".csv":
+                continue
+            if MainWindow._is_orbit_cluster_raw_csv(path):
+                continue
+            if not MainWindow._cluster_csv_has_dri_cluster_header(path):
+                continue
+            out.append(str(path))
+        return out
+
     def _on_rcs_save_image(self) -> None:
         if not self._has_rcs_plot_content():
             QtWidgets.QMessageBox.information(self, "无图像", "当前没有可保存的RCS图像。")
@@ -7101,8 +8232,17 @@ class MainWindow(QtWidgets.QMainWindow):
             facecolor="white",
         )
         export_fig.clf()
-        self.rcs_status_label.setText(f"RCS图片已保存 {output_path}")
-        self._log(f"RCS图片已保存: {output_path}")
+        csv_note = ""
+        csv_sources = self._current_rcs_curve_csv_source_paths()
+        if csv_sources:
+            _filtered_paths, combined_path = self._try_export_rcs_curve_csvs(
+                csv_sources,
+                self._rcs_plot_calibration_db,
+            )
+            if combined_path is not None:
+                csv_note = f" | CSV={combined_path}"
+        self.rcs_status_label.setText(f"RCS图片已保存 {output_path}{csv_note}")
+        self._log(f"RCS图片已保存: {output_path}{csv_note}")
 
     def _save_rcs_fit_image(self) -> Optional[str]:
         if self._rcs_fitted is None or self.rcs_recorder.oid is None:
@@ -7196,13 +8336,23 @@ class MainWindow(QtWidgets.QMainWindow):
                 return t
         return None
 
+    def _orbit_rcs_effective_forward_gate_m(self) -> float:
+        """圆周 RCS 尚无落盘点时放宽前向距离半宽，便于首次锁定；有采样后恢复窄门。"""
+        base = float(ORBIT_RCS_FORWARD_GATE_M)
+        if not self._orbit_rcs_active:
+            return base
+        if len(self._orbit_rcs_rows) > 0:
+            return base
+        return float(max(base, float(ORBIT_RCS_FORWARD_GATE_RELAXED_M)))
+
     def _pick_meas_in_forward_gate(
         self,
         candidates: List[ObjMeas],
         prefer_oid: Optional[int],
+        gate_m: float,
     ) -> Optional[ObjMeas]:
         nom = float(ORBIT_RCS_NOMINAL_FORWARD_M)
-        gate = float(ORBIT_RCS_FORWARD_GATE_M)
+        gate = float(gate_m)
         in_gate = [m for m in candidates if abs(float(m.x) - nom) <= gate]
         if not in_gate:
             return None
@@ -7353,14 +8503,16 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         nom = float(ORBIT_RCS_NOMINAL_FORWARD_M)
-        gate = float(ORBIT_RCS_FORWARD_GATE_M)
+        gate = self._orbit_rcs_effective_forward_gate_m()
         in_gate = [m for m in fresh_candidates if abs(float(m.x) - nom) <= gate]
 
         if not self.rcs_lock.armed:
-            m_use = self._pick_meas_in_forward_gate(fresh_candidates, self.tracked_target_id)
+            m_use = self._pick_meas_in_forward_gate(
+                fresh_candidates, self.tracked_target_id, gate
+            )
             if m_use is None:
                 self.rcs_status_label.setText(
-                    f"圆周RCS: 等待前向≈{ORBIT_RCS_NOMINAL_FORWARD_M:.0f}m目标 (±{ORBIT_RCS_FORWARD_GATE_M:.0f}m)"
+                    f"圆周RCS: 等待前向≈{ORBIT_RCS_NOMINAL_FORWARD_M:.0f}m目标 (±{gate:.0f}m)"
                 )
                 self._draw_rcs(live=True)
                 return
@@ -7394,19 +8546,9 @@ class MainWindow(QtWidgets.QMainWindow):
         r_f = float(getattr(m_use, "rcs_kf_db", float("nan")))
         if not math.isfinite(r_f):
             r_f = r_raw
-        theta = math.atan2(float(m_use.y), float(m_use.x))
         self.rcs_recorder.oid = int(m_use.oid)
-        self._orbit_rcs_rows.append(
-            {
-                "t": float(m_use.t),
-                "theta_rad": float(theta),
-                "rcs_raw": r_raw,
-                "rcs_filt": float(r_f),
-                "x": float(m_use.x),
-                "y": float(m_use.y),
-                "oid": int(m_use.oid),
-            }
-        )
+        # 仅缓存 t + 合并后 RCS 供极坐标预览；与 Cluster Raw 行内功率合并一致，不落盘单独极坐标表。
+        self._orbit_rcs_rows.append({"t": float(m_use.t), "rcs_filt": float(r_f)})
         self._orbit_polar_cached_series = self._build_orbit_polar_series_from_rows(self._orbit_rcs_rows)
         self.rcs_status_label.setText(
             f"圆周RCS: 进行中 | id={m_use.oid} x={m_use.x:.1f}m RCS={r_raw:.1f}dBsm 点={len(self._orbit_rcs_rows)}"
@@ -7426,7 +8568,11 @@ class MainWindow(QtWidgets.QMainWindow):
             nf, nc = rt.snapshot_stats()
             tag = "圆周" if self._orbit_rcs_active else "距离"
             self.rcs_status_label.setText(f"Cluster RCS CSV ({tag}): 帧≈{nf} 簇≈{nc}")
-            self._draw_rcs(live=True)
+            # 圆周段与 Cluster CSV 同时录制时也必须更新极坐标采样，否则「圆周-RCS」图始终为空
+            if self._orbit_rcs_active:
+                self._update_orbit_rcs_recording(targets, raw_clusters)
+            else:
+                self._draw_rcs(live=True)
             return
         if self._orbit_rcs_active:
             self._update_orbit_rcs_recording(targets, raw_clusters)
@@ -7568,7 +8714,10 @@ class MainWindow(QtWidgets.QMainWindow):
             angle_cycles.append((angle, max(1, int(raw_cycles))))
         inner_radius = self._normalize_positive_float(spec.inner_radius_m, 4.0)
         line_length = self._normalize_positive_float(getattr(spec, "line_length_m", 50.0), 50.0)
-        speed_mps = self._normalize_speed_mps(spec.speed_mps, DEFAULT_SEGMENT_SPEED_MPS)
+        speed_mps = self._normalize_speed_mps(
+            spec.speed_mps,
+            float(getattr(self, "_radial_default_speed_mps", DEFAULT_RADIAL_MEASUREMENT_SPEED_MPS)),
+        )
         accel_dist_m = self._normalize_positive_float(
             spec.accel_dist_m,
             DEFAULT_ACCEL_DIST_M,
@@ -7933,6 +9082,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._planned_range_task_names = (
             list(plan_range_task_names) if self._planned_ranges else []
         )
+        self._planned_segment_kinds = None
         if not self._apply_planned_local_points(local_points, frame=resolved_frame):
             return False
 
@@ -7945,6 +9095,7 @@ class MainWindow(QtWidgets.QMainWindow):
             getattr(normalized, "line_length_m", 50.0)
         )
         self._radial_default_line_length_m = float(getattr(normalized, "line_length_m", 50.0))
+        self._radial_default_speed_mps = float(normalized.speed_mps)
         self._path_speed = float(normalized.speed_mps)
         self._traj_default_accel_dist = float(normalized.accel_dist_m)
         self._traj_default_decel_dist = float(normalized.decel_dist_m)
@@ -7973,7 +9124,7 @@ class MainWindow(QtWidgets.QMainWindow):
             default_angle_cycles=self._radial_default_angle_cycles,
             default_inner_radius=self._radial_default_inner_radius,
             default_line_length_m=float(getattr(self, "_radial_default_line_length_m", 50.0)),
-            default_speed=self._path_speed,
+            default_speed=float(getattr(self, "_radial_default_speed_mps", DEFAULT_RADIAL_MEASUREMENT_SPEED_MPS)),
             default_accel_dist=self._traj_default_accel_dist,
             default_decel_dist=self._traj_default_decel_dist,
             parent=self,
@@ -8037,6 +9188,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._planned_ranges = list(plan.ranges) if self._should_use_segment_ranges(list(plan.ranges)) else None
         self._planned_range_task_names = list(plan.range_task_names) if self._planned_ranges else []
+        self._planned_segment_kinds = None
         if not self._apply_planned_local_points(
             list(plan.local_points),
             frame=task_frame,
@@ -8150,6 +9302,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._clear_radial_measurement_spec()
         self._planned_ranges = ranges if self._should_use_segment_ranges(ranges) else None
         self._planned_range_task_names = []
+        self._planned_segment_kinds = None
         if not self._apply_planned_local_points(local_points, frame=frame):
             return
 
@@ -8978,15 +10131,50 @@ class MainWindow(QtWidgets.QMainWindow):
         segment_ranges: List[SegmentRange],
         path_points: List[Tuple[float, float]],
     ) -> List[SegmentRange]:
-        # 星型测量：仅对规划器标了 RCS 的前进测量直线段录制（每趟往返一次前进段），
-        # 不因「前进直线段均录 RCS」把过渡/对齐短直线也纳入，避免与直线默认语义不一致。
         if self._radial_measurement_spec is not None:
-            return segment_ranges
+            # 星型测量：强制覆盖所有带“星型角度_第N次”任务名的前进直线段；
+            # 过渡、对齐短直线和倒车段没有“第N次”任务名，不纳入 RCS 采集。
+            out: List[SegmentRange] = []
+            names = list(self._planned_range_task_names or [])
+            for si, seg in enumerate(segment_ranges):
+                (
+                    start_idx,
+                    end_idx,
+                    speed_sign,
+                    rcs_start,
+                    cruise_speed_mps,
+                    accel_dist,
+                    decel_dist,
+                ) = seg
+                pts = path_points[int(start_idx) : int(end_idx) + 1]
+                name = (
+                    str(names[si]).strip()
+                    if si < len(names) and names[si]
+                    else ""
+                )
+                forward_measure_line = (
+                    int(speed_sign) > 0
+                    and len(pts) >= 2
+                    and self._is_radial_forward_rcs_task_name(name)
+                )
+                out.append(
+                    (
+                        start_idx,
+                        end_idx,
+                        speed_sign,
+                        bool(rcs_start) or bool(forward_measure_line),
+                        cruise_speed_mps,
+                        accel_dist,
+                        decel_dist,
+                    )
+                )
+            return out
         chk = getattr(self, "chk_rcs_all_forward_straight", None)
         if chk is None or not chk.isChecked():
             return segment_ranges
+        kinds = getattr(self, "_planned_segment_kinds", None) or []
         out: List[SegmentRange] = []
-        for seg in segment_ranges:
+        for si, seg in enumerate(segment_ranges):
             (
                 start_idx,
                 end_idx,
@@ -8998,7 +10186,13 @@ class MainWindow(QtWidgets.QMainWindow):
             ) = seg
             forward = int(speed_sign) > 0
             pts = path_points[int(start_idx) : int(end_idx) + 1]
-            straight = len(pts) >= 2 and MainWindow._is_nearly_straight_segment(pts)
+            kind = str(kinds[si]).strip().lower() if si < len(kinds) else ""
+            if kind == "circle":
+                straight = False
+            elif kind == "line":
+                straight = len(pts) >= 2
+            else:
+                straight = len(pts) >= 2 and MainWindow._is_nearly_straight_segment(pts)
             use_rcs = True if (forward and straight) else bool(rcs_start)
             out.append(
                 (
@@ -9250,7 +10444,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self,
         local_points: List[Tuple[float, float]],
         ranges: Optional[List[SegmentRange]] = None,
-    ) -> Tuple[List[Tuple[float, float]], List[SegmentRange], Dict[str, Any]]:
+        segment_kinds: Optional[List[str]] = None,
+    ) -> Tuple[List[Tuple[float, float]], List[SegmentRange], Optional[List[str]], Dict[str, Any]]:
         original_points = [(float(x), float(y)) for x, y in local_points]
         normalized_ranges = [
             self._normalize_segment_range(seg_range) for seg_range in (ranges or [])
@@ -9264,18 +10459,24 @@ class MainWindow(QtWidgets.QMainWindow):
             "changed": False,
         }
         if len(original_points) < 2:
-            return original_points, normalized_ranges, stats
+            return original_points, normalized_ranges, self._remap_segment_kinds_list(
+                segment_kinds, normalized_ranges
+            ), stats
 
         original_s = self._compute_path_cumulative_lengths(original_points)
         total_len = float(original_s[-1]) if original_s else 0.0
         stats["total_length_m"] = total_len
         if total_len <= 1e-6:
-            return original_points, normalized_ranges, stats
+            return original_points, normalized_ranges, self._remap_segment_kinds_list(
+                segment_kinds, normalized_ranges
+            ), stats
 
         compacted = self._compress_path_points(original_points, PATH_DUPLICATE_EPS_M)
         stats["cleaned_points"] = len(compacted)
         if len(compacted) < 2:
-            return original_points, normalized_ranges, stats
+            return original_points, normalized_ranges, self._remap_segment_kinds_list(
+                segment_kinds, normalized_ranges
+            ), stats
 
         step_m = self._choose_path_resample_step(original_points, normalized_ranges)
         stats["resample_step_m"] = float(step_m)
@@ -9304,10 +10505,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         processed_s = self._compute_path_cumulative_lengths(processed_points)
         remapped_ranges: List[SegmentRange] = []
+        remapped_kinds: List[str] = []
+        kinds_parallel = bool(segment_kinds) and len(segment_kinds) == len(normalized_ranges)
         prev_end_s: Optional[float] = None
         prev_end_idx: Optional[int] = None
         last_input_idx = len(original_points) - 1
-        for seg_range in normalized_ranges:
+        for range_idx, seg_range in enumerate(normalized_ranges):
             start_idx = max(0, min(int(seg_range[0]), last_input_idx))
             end_idx = max(0, min(int(seg_range[1]), last_input_idx))
             if end_idx <= start_idx:
@@ -9339,6 +10542,9 @@ class MainWindow(QtWidgets.QMainWindow):
                     seg_range[6],
                 )
             )
+            if kinds_parallel:
+                k0 = str(segment_kinds[range_idx] or "line").strip().lower()
+                remapped_kinds.append(k0 if k0 in ("line", "circle") else "line")
             prev_end_s = end_s
             prev_end_idx = new_end_idx
 
@@ -9347,7 +10553,23 @@ class MainWindow(QtWidgets.QMainWindow):
             stats["cleaned_points"] != stats["input_points"]
             or stats["output_points"] != stats["input_points"]
         )
-        return processed_points, remapped_ranges, stats
+        out_kinds: Optional[List[str]] = None
+        if kinds_parallel and len(remapped_kinds) == len(remapped_ranges):
+            out_kinds = remapped_kinds
+        return processed_points, remapped_ranges, out_kinds, stats
+
+    @staticmethod
+    def _remap_segment_kinds_list(
+        kinds: Optional[List[str]],
+        ranges: List[SegmentRange],
+    ) -> Optional[List[str]]:
+        if not kinds or len(kinds) != len(ranges):
+            return None
+        out: List[str] = []
+        for k in kinds:
+            k0 = str(k or "line").strip().lower()
+            out.append(k0 if k0 in ("line", "circle") else "line")
+        return out
 
     def _build_ranges_from_point_metadata(
         self,
@@ -9624,10 +10846,19 @@ class MainWindow(QtWidgets.QMainWindow):
             self._log("轨迹规划失败: 未添加轨迹段")
             return
         frame = self._get_path_anchor_reference_frame()
-        local_points, ranges = self._build_planned_path(segments)
+        local_points, ranges, plan_kinds = self._build_planned_path(segments)
         self._set_loaded_task_sequence([], 0)
         self._clear_radial_measurement_spec()
         self._planned_ranges = ranges if self._should_use_segment_ranges(ranges) else None
+        self._planned_segment_kinds = (
+            list(plan_kinds)
+            if (
+                self._planned_ranges
+                and plan_kinds
+                and len(plan_kinds) == len(self._planned_ranges)
+            )
+            else None
+        )
         self._planned_range_task_names = []
         self._log(f"轨迹规划生成: 段数={len(segments)} 点数={len(local_points)}")
         if len(local_points) < 2:
@@ -9636,7 +10867,13 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         preset_name = self._prompt_preset_name()
         if preset_name:
-            self._save_preset_path(preset_name, local_points, ranges, frame=frame)
+            self._save_preset_path(
+                preset_name,
+                local_points,
+                ranges,
+                frame=frame,
+                segment_kinds=self._planned_segment_kinds,
+            )
             self._set_current_path_name(preset_name)
         else:
             self._log("轨迹规划未保存为预设轨迹")
@@ -9654,14 +10891,23 @@ class MainWindow(QtWidgets.QMainWindow):
             self._log("轨迹规划失败: 点数不足")
             return False
 
-        stabilized_points, stabilized_ranges, stab_stats = self._stabilize_local_path_for_tracking(
-            local_points,
-            self._planned_ranges,
+        stabilized_points, stabilized_ranges, stabilized_kinds, stab_stats = (
+            self._stabilize_local_path_for_tracking(
+                local_points,
+                self._planned_ranges,
+                getattr(self, "_planned_segment_kinds", None),
+            )
         )
         local_points = stabilized_points
         self._planned_ranges = (
             stabilized_ranges if self._should_use_segment_ranges(stabilized_ranges) else None
         )
+        if self._planned_ranges and stabilized_kinds and len(stabilized_kinds) == len(
+            self._planned_ranges
+        ):
+            self._planned_segment_kinds = list(stabilized_kinds)
+        else:
+            self._planned_segment_kinds = None
         if stab_stats["total_length_m"] > 1e-6:
             self._log(
                 "轨迹稳定化: "
@@ -9757,11 +11003,12 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_planned_path(
         self,
         segments: List[dict],
-    ) -> Tuple[List[Tuple[float, float]], List[SegmentRange]]:
+    ) -> Tuple[List[Tuple[float, float]], List[SegmentRange], List[str]]:
         line_step = 1.2
         circle_step = 0.12
         points: List[Tuple[float, float]] = [(0.0, 0.0)]
         ranges: List[SegmentRange] = []
+        segment_kinds: List[str] = []
         x, y = 0.0, 0.0
         heading = math.pi * 0.5
 
@@ -9773,6 +11020,7 @@ class MainWindow(QtWidgets.QMainWindow):
             accel_dist: Any,
             decel_dist: Any,
             rcs_start: bool = False,
+            segment_kind: str = "line",
         ) -> None:
             if end_idx - start_idx >= 1:
                 ranges.append(
@@ -9786,6 +11034,8 @@ class MainWindow(QtWidgets.QMainWindow):
                         self._normalize_positive_float(decel_dist, DEFAULT_DECEL_DIST_M),
                     )
                 )
+                sk = str(segment_kind or "line").strip().lower()
+                segment_kinds.append(sk if sk in ("line", "circle") else "line")
 
         seg_idx = 0
         while seg_idx < len(segments):
@@ -9819,6 +11069,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         seg.get("accel_dist", DEFAULT_ACCEL_DIST_M),
                         seg.get("decel_dist", DEFAULT_DECEL_DIST_M),
                         rcs_start,
+                        segment_kind="line",
                     )
                     # 倒车不改变车头朝向；仅路径切向反向
                     if speed_sign < 0:
@@ -9865,9 +11116,10 @@ class MainWindow(QtWidgets.QMainWindow):
                     seg.get("accel_dist", DEFAULT_ACCEL_DIST_M),
                     seg.get("decel_dist", DEFAULT_DECEL_DIST_M),
                     bool(seg.get("rcs_start")),
+                    segment_kind="circle",
                 )
             seg_idx += 1
-        return points, ranges
+        return points, ranges, segment_kinds
 
     def _build_line_circle_transition(
         self,
@@ -10388,9 +11640,164 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _clear_radial_measurement_spec(self) -> None:
         self._radial_measurement_spec = None
+        self._clear_radial_rcs_session_state()
+
+    def _clear_radial_rcs_session_state(self) -> None:
+        self._radial_rcs_session_dir = None
+        self._radial_rcs_expected_segments = []
+        self._radial_rcs_started_segments.clear()
+        self._radial_rcs_finished_segments.clear()
+        self._radial_rcs_failed_segments.clear()
+
+    @staticmethod
+    def _format_radial_rcs_segment_label(angle_deg: int, cycle_index: int) -> str:
+        return f"{int(angle_deg) % 360}度第{max(1, int(cycle_index))}次测量"
+
+    @staticmethod
+    def _parse_radial_rcs_task_name(task_name: Optional[str]) -> Optional[Tuple[int, Optional[int]]]:
+        s = str(task_name or "").strip()
+        if not s:
+            return None
+        m = re.search(r"星型\s*(\d+)\s*(?:°|度)(?:\s*[_\-]?\s*第\s*(\d+)\s*次)?", s)
+        if not m:
+            return None
+        angle = int(m.group(1)) % 360
+        cycle = int(m.group(2)) if m.group(2) else None
+        return angle, cycle
+
+    def _radial_rcs_segment_label_from_task(self, segment_task_name: Optional[str]) -> str:
+        parsed = self._parse_radial_rcs_task_name(segment_task_name)
+        if parsed is not None:
+            angle, cycle = parsed
+            return self._format_radial_rcs_segment_label(angle, cycle or 1)
+        fallback = str(segment_task_name or "").strip().replace("°", "度")
+        return fallback or "0度第1次测量"
+
+    def _radial_rcs_segment_file_stem(self, segment_task_name: Optional[str]) -> str:
+        return self._safe_filename_token(
+            self._radial_rcs_segment_label_from_task(segment_task_name)
+        )
+
+    def _is_radial_forward_rcs_task_name(self, task_name: Optional[str]) -> bool:
+        parsed = self._parse_radial_rcs_task_name(task_name)
+        return bool(parsed is not None and parsed[1] is not None)
+
+    def _expected_radial_rcs_segment_labels(self) -> List[str]:
+        spec = self._radial_measurement_spec
+        if spec is None:
+            return []
+        labels: List[str] = []
+        for angle, cycles in list(spec.angle_cycles or []):
+            for cycle in range(1, max(1, int(cycles)) + 1):
+                labels.append(self._format_radial_rcs_segment_label(int(angle), cycle))
+        return labels
+
+    def _planned_radial_rcs_segment_labels(self) -> List[str]:
+        if self._radial_measurement_spec is None:
+            return []
+        labels: List[str] = []
+        ranges = list(self._planned_ranges or [])
+        range_task_names = list(self._planned_range_task_names or [])
+        for seg_idx, _seg_range in enumerate(ranges, start=1):
+            name = (
+                str(range_task_names[seg_idx - 1]).strip()
+                if seg_idx - 1 < len(range_task_names) and range_task_names[seg_idx - 1]
+                else ""
+            )
+            if not self._is_radial_forward_rcs_task_name(name):
+                continue
+            if self._segment_index_is_forward_straight_segment(seg_idx):
+                labels.append(self._radial_rcs_segment_label_from_task(name))
+        return labels
+
+    def _begin_radial_rcs_session(self) -> Optional[Path]:
+        if self._radial_measurement_spec is None:
+            self._clear_radial_rcs_session_state()
+            return None
+        self._clear_radial_rcs_session_state()
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        session_dir = self._unique_output_path(
+            Path(self._rcs_save_dir) / self._safe_filename_token(f"星型测量_{stamp}")
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+        self._radial_rcs_session_dir = session_dir
+        self._radial_rcs_expected_segments = self._expected_radial_rcs_segment_labels()
+        planned = self._planned_radial_rcs_segment_labels()
+        missing_plan = [label for label in self._radial_rcs_expected_segments if label not in planned]
+        msg = (
+            f"星型RCS采集会话已创建: 目录={session_dir} | "
+            f"计划前进直线段={len(self._radial_rcs_expected_segments)}"
+        )
+        if missing_plan:
+            preview = "、".join(missing_plan[:8])
+            if len(missing_plan) > 8:
+                preview += "..."
+            msg += f" | 规划覆盖检查缺失={preview}"
+        self._log(msg)
+        return session_dir
+
+    def _ensure_radial_rcs_session_dir(self) -> Optional[Path]:
+        if self._radial_measurement_spec is None:
+            return None
+        if self._radial_rcs_session_dir is None:
+            return self._begin_radial_rcs_session()
+        return self._radial_rcs_session_dir
+
+    def _mark_radial_rcs_started(self, segment_task_name: Optional[str]) -> str:
+        label = self._radial_rcs_segment_label_from_task(segment_task_name)
+        self._radial_rcs_started_segments.add(label)
+        return label
+
+    def _mark_radial_rcs_finished(
+        self,
+        segment_task_name: Optional[str],
+        *,
+        success: bool,
+    ) -> None:
+        label = self._radial_rcs_segment_label_from_task(segment_task_name)
+        if success:
+            self._radial_rcs_finished_segments.add(label)
+            self._radial_rcs_failed_segments.discard(label)
+        else:
+            self._radial_rcs_failed_segments.add(label)
+
+    def _finish_radial_rcs_session_report(self) -> None:
+        if (
+            self._radial_rcs_session_dir is None
+            and not self._radial_rcs_expected_segments
+            and not self._radial_rcs_started_segments
+        ):
+            return
+        session_dir = self._radial_rcs_session_dir
+        expected = list(self._radial_rcs_expected_segments)
+        finished = set(self._radial_rcs_finished_segments)
+        missing = [label for label in expected if label not in finished]
+        failed = [label for label in self._radial_rcs_failed_segments if label not in finished]
+        csv_count = 0
+        if session_dir is not None:
+            try:
+                csv_count = len([p for p in Path(session_dir).glob("*.csv") if p.is_file()])
+            except Exception:
+                csv_count = 0
+
+        if missing:
+            preview = "、".join(missing[:10])
+            if len(missing) > 10:
+                preview += "..."
+            self._log(
+                f"星型RCS采集结束: 目录={session_dir} | "
+                f"已记录={len(finished)}/{len(expected)} | CSV={csv_count} | 缺失={preview}"
+            )
+        else:
+            extra = f" | 失败重试项={len(failed)}" if failed else ""
+            self._log(
+                f"星型RCS采集结束: 目录={session_dir} | "
+                f"已记录全部前进直线段={len(finished)}/{len(expected)} | CSV={csv_count}{extra}"
+            )
+        self._clear_radial_rcs_session_state()
 
     def _radial_rcs_group_file_trajectory_name(self, segment_task_name: str) -> str:
-        """星型测量：同一角度的多趟前进 RCS 合并为一个文件，文件名仅带该角度（如 星型45°）。"""
+        """兼容旧的内存 RCS 聚合：同一角度多趟可合并到一个逻辑轨迹名。"""
         if self._radial_measurement_spec is None:
             return segment_task_name
         s = str(segment_task_name).strip()
@@ -10444,7 +11851,8 @@ class MainWindow(QtWidgets.QMainWindow):
     @staticmethod
     def _build_uniform_stanley_tracking_kwargs() -> Dict[str, Any]:
         return {
-            "stanley_gain": 0.95,
+            "stanley_gain": 0.30,
+            "stanley_softening_speed_mps": 1.0,
             "prime_pid_on_first_cycle": True,
             "reverse_mirror_errors": False,
             "smoothing_strength": 0.82,
@@ -10485,6 +11893,10 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         self._reset_rcs_trajectory_file_cache()
+        if self._radial_measurement_spec is not None:
+            self._begin_radial_rcs_session()
+        else:
+            self._clear_radial_rcs_session_state()
         tracking_mode = self._get_path_tracking_mode()
         tracking_label = self._get_path_tracking_mode_label()
         uniform_stanley_tracking = self._use_uniform_stanley_tracking_for_planned_path()
@@ -10587,7 +11999,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         active_rcs_segment_idx = None
                         active_rcs_trajectory_name = None
                     continue
-                is_straight = self._is_nearly_straight_segment(segment_points)
+                is_straight = self._segment_geometry_is_straight(seg_idx, segment_points)
                 segment_len = self._estimate_segment_length(segment_points)
                 seg_speed = speed_sign * cruise_speed_mps
                 lookahead = 0.28 if is_straight else 0.48
@@ -10602,14 +12014,15 @@ class MainWindow(QtWidgets.QMainWindow):
                         ppts = self.loaded_path_points[ps_i : pe_i + 1]
                         if len(ppts) >= 2:
                             prev_straight_then_current_curve = (
-                                self._is_nearly_straight_segment(ppts) and (not is_straight)
+                                self._segment_geometry_is_straight(seg_idx - 1, ppts)
+                                and (not is_straight)
                             )
                 next_range = segment_ranges[seg_idx] if seg_idx < len(segment_ranges) else None
                 next_points: List[Tuple[float, float]] = []
                 next_is_straight = False
                 if next_range is not None and next_range[1] > next_range[0]:
                     next_points = self.loaded_path_points[next_range[0] : next_range[1] + 1]
-                    next_is_straight = self._is_nearly_straight_segment(next_points)
+                    next_is_straight = self._segment_geometry_is_straight(seg_idx + 1, next_points)
                 next_continuous = (
                     next_range is not None
                     and next_range[2] == speed_sign
@@ -10740,7 +12153,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     if tracking_mode != "stanley_pid":
                         kwargs.update(self._build_uniform_stanley_tracking_kwargs())
                     # 星型测量：直线段与过渡曲线段参数分开使用（都采用圆周同款的路径加密与角速度约束）。
-                    # - 直线段：gain=0.4（更稳，避免蛇形）
+                    # - 测量/返回直线段：gain=0.3 + softening=1.0，降低小 S 摆动
                     # - 过渡曲线：gain=0.1 + 更大的 softening + 适当降速（更“软”，减少切换时急转）
                     if is_transition_segment:
                         kwargs["stanley_gain"] = 0.1
@@ -10755,7 +12168,8 @@ class MainWindow(QtWidgets.QMainWindow):
                             seg_speed,
                         )
                     else:
-                        kwargs["stanley_gain"] = 0.4
+                        kwargs["stanley_gain"] = 0.3
+                        kwargs["stanley_softening_speed_mps"] = 1.0
                     seg_points_use = self._densify_polyline_for_tracking(
                         segment_points, max_step_m=0.08
                     )
@@ -10877,45 +12291,89 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._log(f"完整运动记录合并失败: {exc}")
             self._motion_full_session_active = False
             self._motion_full_session_accumulator.clear()
+            if self._radial_measurement_spec is not None:
+                self._finish_radial_rcs_session_report()
             self._motion_active = False
             self._reset_motion_guard_runtime(clear_profile=False)
             self.motion_run_finished.emit("分段轨迹")
 
     def _on_segment_rcs_start_requested(self, seg_idx: int, trajectory_name: str) -> None:
-        if not self._segment_index_is_forward_straight_segment(seg_idx):
+        is_straight = self._segment_index_is_forward_straight_segment(seg_idx)
+        is_curved = self._segment_index_is_forward_curved_segment(seg_idx)
+        if not is_straight and not is_curved:
             self._log(
-                f"第{seg_idx}段 RCS跳过: 仅在前进直线段记录（倒车/圆弧/弯段或非直线几何不采集）"
+                f"第{seg_idx}段 RCS跳过: 仅在前进直线段或前进圆弧/曲线段记录（倒车或非前进不采集）"
             )
             return
         if self._rcs_recording:
             self._log(f"第{seg_idx}段开始前检测到上一段RCS仍在记录，先自动收尾")
-            auto_traj = self._radial_rcs_group_file_trajectory_name(
+            prev_traj_name = (
                 str(self._rcs_active_path_name or self._get_current_path_name()).strip()
                 or "轨迹"
             )
-            self._finalize_rcs_recording(
+            auto_traj = (
+                prev_traj_name
+                if self._radial_measurement_spec is not None
+                else self._radial_rcs_group_file_trajectory_name(prev_traj_name)
+            )
+            n_frames, raw_path, _fit_path = self._finalize_rcs_recording(
                 save_raw=True,
                 trajectory_name=auto_traj,
                 segment_index=self._rcs_active_segment_index,
             )
-        self._log(f"第{seg_idx}段开始: 前进直线段 Cluster(0x701) RCS CSV 采集")
-        self._on_rcs_start(segment_index=seg_idx, trajectory_name=trajectory_name)
+            if self._radial_measurement_spec is not None:
+                row_count = self._cluster_csv_data_row_count(Path(raw_path)) if raw_path else 0
+                self._mark_radial_rcs_finished(
+                    prev_traj_name,
+                    success=bool(raw_path) and (int(n_frames) > 0 or row_count > 0),
+                )
+        if is_straight:
+            label_text = ""
+            if self._radial_measurement_spec is not None:
+                label_text = self._mark_radial_rcs_started(trajectory_name)
+                self._ensure_radial_rcs_session_dir()
+            self._log(
+                f"第{seg_idx}段开始: 前进直线段 Cluster(0x701) RCS CSV 采集"
+                + (f" | {label_text}" if label_text else "")
+            )
+            if not self._on_rcs_start(segment_index=seg_idx, trajectory_name=trajectory_name):
+                if self._radial_measurement_spec is not None:
+                    self._mark_radial_rcs_finished(trajectory_name, success=False)
+            return
+        self._log(
+            f"第{seg_idx}段开始: 前进圆弧/曲线段 圆周RCS（极坐标采样 CSV + 宽横向 Cluster CSV）"
+        )
+        self._on_orbit_rcs_start(segment_index=seg_idx, trajectory_name=trajectory_name)
 
     def _on_segment_rcs_finish_requested(self, seg_idx: int, trajectory_name: str) -> None:
         if self._rcs_active_segment_index is not None and self._rcs_active_segment_index != seg_idx:
             self._log(
                 f"第{seg_idx}段 RCS自动保存忽略: 当前活跃分段={self._rcs_active_segment_index}"
             )
+            if self._radial_measurement_spec is not None:
+                self._mark_radial_rcs_finished(trajectory_name, success=False)
             return
         if not self._rcs_recording:
             self._log(f"第{seg_idx}段 RCS自动保存跳过: 当前未在记录")
+            if self._radial_measurement_spec is not None:
+                self._mark_radial_rcs_finished(trajectory_name, success=False)
             return
-        save_traj_name = self._radial_rcs_group_file_trajectory_name(trajectory_name)
-        self._finalize_rcs_recording(
+        save_traj_name = (
+            trajectory_name
+            if self._radial_measurement_spec is not None
+            else self._radial_rcs_group_file_trajectory_name(trajectory_name)
+        )
+        n_frames, raw_path, _fit_path = self._finalize_rcs_recording(
             save_raw=True,
             trajectory_name=save_traj_name,
             segment_index=seg_idx,
         )
+        if self._radial_measurement_spec is not None:
+            row_count = self._cluster_csv_data_row_count(Path(raw_path)) if raw_path else 0
+            self._mark_radial_rcs_finished(
+                trajectory_name,
+                success=bool(raw_path) and (int(n_frames) > 0 or row_count > 0),
+            )
 
     def _on_radar_point_clicked(self, *args) -> None:
         points = []
@@ -11113,6 +12571,17 @@ class MainWindow(QtWidgets.QMainWindow):
         targets: List[Any] = []
         clusters_raw: List[Any] = []
         rt_cluster = getattr(self.controller, "cluster_csv_runtime", None)
+        wide_lateral = self._orbit_rcs_active or (
+            rt_cluster is not None
+            and bool(getattr(rt_cluster, "_orbit_roi_session", False))
+        )
+        if wide_lateral != self._radar_plot_wide_lateral_active:
+            self._radar_plot_wide_lateral_active = wide_lateral
+            if self.radar_plot is not None:
+                if wide_lateral:
+                    self.radar_plot.setXRange(-11.0, 11.0)
+                else:
+                    self.radar_plot.setXRange(-2.5, 2.5)
         if rt_cluster is not None:
             ts_snap, clusters_raw = rt_cluster.get_cluster_display_snapshot()
             merged = MainWindow._group_cluster_dicts_for_individual_targets(
