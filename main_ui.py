@@ -974,7 +974,7 @@ class RadialMeasurementDialog(QtWidgets.QDialog):
 
         intro = QtWidgets.QLabel(
             "围绕已标定目标物生成每隔30°的一组直线测量轨迹。"
-            "0° 以轨迹原点指向目标物的方向为基准（右侧为正30°），每个角度都可以单独设置往返测量次数。"
+            "0° 以轨迹原点指向目标物的方向为基准（左侧为正30°），每个角度都可以单独设置往返测量次数。"
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
@@ -1064,7 +1064,7 @@ class RadialMeasurementDialog(QtWidgets.QDialog):
         layout.addLayout(form)
 
         hint = QtWidgets.QLabel(
-            "说明: 0° 为轨迹原点(锚点)到目标物的方向，角度按“向右(顺时针)为正”增加。"
+            "说明: 0° 为轨迹原点(锚点)到目标物的方向，角度按“向左(逆时针)为正”增加。"
             "系统会自动把不同角度的测量轨迹放在目标外侧进行平滑连接，尽量减少原地大角度掉头。"
         )
         hint.setWordWrap(True)
@@ -9083,7 +9083,11 @@ class MainWindow(QtWidgets.QMainWindow):
             list(plan_range_task_names) if self._planned_ranges else []
         )
         self._planned_segment_kinds = None
-        if not self._apply_planned_local_points(local_points, frame=resolved_frame):
+        if not self._apply_planned_local_points(
+            local_points,
+            frame=resolved_frame,
+            stabilize=False,
+        ):
             return False
 
         self._radial_measurement_spec = normalized
@@ -9189,6 +9193,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._planned_ranges = list(plan.ranges) if self._should_use_segment_ranges(list(plan.ranges)) else None
         self._planned_range_task_names = list(plan.range_task_names) if self._planned_ranges else []
         self._planned_segment_kinds = None
+        if len(plan.task_names) == 1 and self._planned_ranges:
+            self._planned_segment_kinds = self._remap_segment_kinds_list(
+                self._preset_segment_kinds.get(plan.task_names[0]),
+                list(plan.ranges),
+            )
         if not self._apply_planned_local_points(
             list(plan.local_points),
             frame=task_frame,
@@ -9269,6 +9278,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._preset_paths.pop(choice, None)
         self._preset_ranges.pop(choice, None)
+        self._preset_segment_kinds.pop(choice, None)
         self._preset_path_frames.pop(choice, None)
         if not self._persist_preset_paths():
             return
@@ -9832,6 +9842,7 @@ class MainWindow(QtWidgets.QMainWindow):
         local_points: List[Tuple[float, float]],
         ranges: Optional[List[SegmentRange]] = None,
         frame: Optional[PathReferenceFrame] = None,
+        segment_kinds: Optional[List[str]] = None,
     ) -> bool:
         if name in self._preset_paths:
             reply = QtWidgets.QMessageBox.question(
@@ -9844,10 +9855,19 @@ class MainWindow(QtWidgets.QMainWindow):
             if reply != QtWidgets.QMessageBox.Yes:
                 self._log(f"预设轨迹保存已取消: {name}")
                 return False
-        self._preset_paths[name] = list(local_points)
-        self._preset_ranges[name] = [
+        normalized_ranges = [
             self._normalize_segment_range(seg_range) for seg_range in (ranges or [])
         ]
+        self._preset_paths[name] = list(local_points)
+        self._preset_ranges[name] = normalized_ranges
+        normalized_segment_kinds = self._remap_segment_kinds_list(
+            segment_kinds,
+            normalized_ranges,
+        )
+        if normalized_segment_kinds:
+            self._preset_segment_kinds[name] = normalized_segment_kinds
+        else:
+            self._preset_segment_kinds.pop(name, None)
         self._preset_path_frames[name] = self._resolve_path_reference_frame(
             frame if frame is not None else self._path_anchor_frame_from_ui()
         )
@@ -9878,6 +9898,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         "speed_mps",
                         "accel_dist",
                         "decel_dist",
+                        "segment_kind",
                         "coord_mode",
                         "origin_key",
                         "origin_label",
@@ -9894,6 +9915,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         [
                             "meta",
                             name,
+                            "",
                             "",
                             "",
                             "",
@@ -9933,9 +9955,11 @@ class MainWindow(QtWidgets.QMainWindow):
                                 "",
                                 "",
                                 "",
+                                "",
                             ]
                         )
                     ranges = self._preset_ranges.get(name, [])
+                    kinds = self._preset_segment_kinds.get(name, [])
                     for idx, (
                         start_idx,
                         end_idx,
@@ -9959,6 +9983,9 @@ class MainWindow(QtWidgets.QMainWindow):
                                 f"{float(speed_mps):.3f}",
                                 f"{float(accel_dist):.3f}",
                                 f"{float(decel_dist):.3f}",
+                                self._normalize_segment_kind(
+                                    kinds[idx] if idx < len(kinds) else ""
+                                ),
                                 "",
                                 "",
                                 "",
@@ -9976,12 +10003,14 @@ class MainWindow(QtWidgets.QMainWindow):
     def _load_preset_paths(self) -> None:
         self._preset_paths.clear()
         self._preset_ranges.clear()
+        self._preset_segment_kinds.clear()
         self._preset_path_frames.clear()
         if not PRESET_PATHS_CSV.exists():
             return
         try:
             temp_points: Dict[str, List[Tuple[int, float, float]]] = {}
             temp_ranges: Dict[str, List[Tuple[int, SegmentRange]]] = {}
+            temp_segment_kinds: Dict[str, List[Tuple[int, str]]] = {}
             temp_frames: Dict[str, PathReferenceFrame] = {}
             with PRESET_PATHS_CSV.open("r", encoding="utf-8", newline="") as f:
                 reader = csv.DictReader(f)
@@ -10036,6 +10065,9 @@ class MainWindow(QtWidgets.QMainWindow):
                                 )
                             )
                             temp_ranges.setdefault(name, []).append((idx, seg_range))
+                            temp_segment_kinds.setdefault(name, []).append(
+                                (idx, self._normalize_segment_kind(row.get("segment_kind", "")))
+                            )
                         continue
 
                     try:
@@ -10058,11 +10090,21 @@ class MainWindow(QtWidgets.QMainWindow):
                 if name not in self._preset_paths:
                     continue
                 segments.sort(key=lambda item: item[0])
-                self._preset_ranges[name] = [
+                normalized_ranges = [
                     seg_range
                     for _, seg_range in segments
                     if seg_range[1] > seg_range[0]
                 ]
+                self._preset_ranges[name] = normalized_ranges
+                kind_rows = temp_segment_kinds.get(name, [])
+                if kind_rows:
+                    kind_rows.sort(key=lambda item: item[0])
+                    ordered_kinds = [kind for _, kind in kind_rows]
+                    if (
+                        len(ordered_kinds) == len(normalized_ranges)
+                        and all(kind in ("line", "circle") for kind in ordered_kinds)
+                    ):
+                        self._preset_segment_kinds[name] = ordered_kinds
 
             if self._preset_paths:
                 self._log(f"已加载预设轨迹: {len(self._preset_paths)}个")
@@ -10095,6 +10137,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def _normalize_speed_mps(value: Any, default: float = DEFAULT_SEGMENT_SPEED_MPS) -> float:
         speed = MainWindow._normalize_positive_float(value, default)
         return max(MIN_SEGMENT_SPEED_MPS, speed)
+
+    @staticmethod
+    def _normalize_segment_kind(value: Any) -> str:
+        kind = str(value or "").strip().lower()
+        return kind if kind in ("line", "circle") else ""
 
     @staticmethod
     def _normalize_segment_range(value: Tuple[Any, ...]) -> SegmentRange:
@@ -10885,37 +10932,42 @@ class MainWindow(QtWidgets.QMainWindow):
         self,
         local_points: List[Tuple[float, float]],
         frame: Optional[PathReferenceFrame] = None,
+        *,
+        stabilize: bool = True,
     ) -> bool:
         if len(local_points) < 2:
             QtWidgets.QMessageBox.information(self, "轨迹无效", "规划轨迹点数量不足。")
             self._log("轨迹规划失败: 点数不足")
             return False
 
-        stabilized_points, stabilized_ranges, stabilized_kinds, stab_stats = (
-            self._stabilize_local_path_for_tracking(
-                local_points,
-                self._planned_ranges,
-                getattr(self, "_planned_segment_kinds", None),
+        if stabilize:
+            stabilized_points, stabilized_ranges, stabilized_kinds, stab_stats = (
+                self._stabilize_local_path_for_tracking(
+                    local_points,
+                    self._planned_ranges,
+                    getattr(self, "_planned_segment_kinds", None),
+                )
             )
-        )
-        local_points = stabilized_points
-        self._planned_ranges = (
-            stabilized_ranges if self._should_use_segment_ranges(stabilized_ranges) else None
-        )
-        if self._planned_ranges and stabilized_kinds and len(stabilized_kinds) == len(
-            self._planned_ranges
-        ):
-            self._planned_segment_kinds = list(stabilized_kinds)
+            local_points = stabilized_points
+            self._planned_ranges = (
+                stabilized_ranges if self._should_use_segment_ranges(stabilized_ranges) else None
+            )
+            if self._planned_ranges and stabilized_kinds and len(stabilized_kinds) == len(
+                self._planned_ranges
+            ):
+                self._planned_segment_kinds = list(stabilized_kinds)
+            else:
+                self._planned_segment_kinds = None
+            if stab_stats["total_length_m"] > 1e-6:
+                self._log(
+                    "轨迹稳定化: "
+                    f"点数 {stab_stats['input_points']} -> {stab_stats['output_points']} "
+                    f"(去重后={stab_stats['cleaned_points']}) | "
+                    f"弧长={stab_stats['total_length_m']:.2f}m | "
+                    f"重采样步长≈{stab_stats['resample_step_m']:.2f}m"
+                )
         else:
-            self._planned_segment_kinds = None
-        if stab_stats["total_length_m"] > 1e-6:
-            self._log(
-                "轨迹稳定化: "
-                f"点数 {stab_stats['input_points']} -> {stab_stats['output_points']} "
-                f"(去重后={stab_stats['cleaned_points']}) | "
-                f"弧长={stab_stats['total_length_m']:.2f}m | "
-                f"重采样步长≈{stab_stats['resample_step_m']:.2f}m"
-            )
+            self._log("轨迹稳定化: 已跳过，保留规划器原始几何。")
 
         if frame is None:
             resolved_frame = self._resolve_path_reference_frame(
@@ -11919,7 +11971,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             if uniform_stanley_tracking:
                 self._log(
-                    f"星型测量执行: 所有分段统一使用 {tracking_label} + 角速度内环反馈。"
+                    f"星型测量执行: 直线往返沿用普通直线控制；仅过渡曲线使用 {tracking_label} 软化跟踪。"
                 )
             t = threading.Thread(
                 target=self._run_planned_ranges,
@@ -12145,16 +12197,17 @@ class MainWindow(QtWidgets.QMainWindow):
                             float(speed_sign)
                         )
                     )
-                if uniform_stanley_tracking:
+                use_uniform_stanley_for_segment = bool(
+                    uniform_stanley_tracking and (not is_straight)
+                )
+                if use_uniform_stanley_for_segment:
                     is_transition_segment = not (
                         seg_idx - 1 < len(range_task_names)
                         and range_task_names[seg_idx - 1]
                     )
                     if tracking_mode != "stanley_pid":
                         kwargs.update(self._build_uniform_stanley_tracking_kwargs())
-                    # 星型测量：直线段与过渡曲线段参数分开使用（都采用圆周同款的路径加密与角速度约束）。
-                    # - 测量/返回直线段：gain=0.3 + softening=1.0，降低小 S 摆动
-                    # - 过渡曲线：gain=0.1 + 更大的 softening + 适当降速（更“软”，减少切换时急转）
+                    # 星型测量：仅过渡曲线使用统一 Stanley 软化参数。
                     if is_transition_segment:
                         kwargs["stanley_gain"] = 0.1
                         kwargs["stanley_softening_speed_mps"] = max(
@@ -12167,9 +12220,6 @@ class MainWindow(QtWidgets.QMainWindow):
                             min(abs(seg_speed), max(0.12, 0.55 * float(cruise_speed_mps))),
                             seg_speed,
                         )
-                    else:
-                        kwargs["stanley_gain"] = 0.3
-                        kwargs["stanley_softening_speed_mps"] = 1.0
                     seg_points_use = self._densify_polyline_for_tracking(
                         segment_points, max_step_m=0.08
                     )
@@ -12263,7 +12313,7 @@ class MainWindow(QtWidgets.QMainWindow):
                             seg_speed,
                             **kwargs,
                         )
-                if (not uniform_stanley_tracking) and is_straight:
+                if is_straight:
                     self.controller.car.follow_path_with_pid(
                         segment_points,
                         seg_speed,

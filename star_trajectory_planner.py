@@ -5,7 +5,7 @@ star_trajectory_planner.py
 
 设计目标：
 - ENU 校准后在平面系选择目标点，以目标点为参考定义角度零方向
-- 角度定义：以「轨迹原点(锚点) -> 目标点」为 0°，向右(顺时针)为正
+- 角度定义：以「轨迹原点(锚点) -> 目标点」为 0°，向左(逆时针)为正
 - 每个角度生成可重复往返的直线：第一条直线由原点与 0°方向确定；后续角度的直线由上一条直线
   以“目标点”为圆心旋转得到（例如 +30°），因此“起点”会随角度在目标点周围旋转
 - 角度切换时，插入外部规划的平滑过渡（如三次 Bezier，呈 S 形），落到下一直线内侧端点前的衔接点，
@@ -26,7 +26,7 @@ SegmentRange = Tuple[int, int, int, bool, float, float, float]
 
 @dataclass(frozen=True)
 class StarMeasurementSpec:
-    # angle_cycles: [(angle_deg, cycles)] 角度以“右侧为正(顺时针)”定义
+    # angle_cycles: [(angle_deg, cycles)] 角度以“左侧为正(逆时针)”定义
     angle_cycles: List[Tuple[int, int]]
     # 距离目标点最近距离（m）：星型测量的“面对目标物”往返以该距离作为最近点
     inner_radius_m: float
@@ -200,16 +200,16 @@ def build_star_measurement_plan(
     prev_heading: Optional[float] = None
 
     for idx_angle, (angle_deg, cycles) in enumerate(angles):
-        # “右侧为正(顺时针)” => 航向 CCW 为正：heading = base - angle
-        heading = _wrap_angle_rad(base_heading - math.radians(float(angle_deg)))
+        # “左侧为正(逆时针)”与数学航向 CCW 为正一致：heading = base + angle
+        heading = _wrap_angle_rad(base_heading + math.radians(float(angle_deg)))
         if prev_start_pt is None or prev_end_pt is None or prev_angle_deg is None:
             # 第一条：以原点出发的 0°/指定角度直线
             start_pt, end_pt = ray_endpoints_from_origin(heading)
         else:
             # 后续：把上一条直线以“目标点”为圆心旋转得到
-            # 注意：角度定义为“向右(顺时针)为正”，而旋转函数以 CCW 为正
-            delta_cw_deg = float(int(angle_deg) - int(prev_angle_deg))
-            delta_ccw_rad = -math.radians(delta_cw_deg)
+            # 角度定义为“向左(逆时针)为正”，与旋转函数的 CCW 正方向一致
+            delta_ccw_deg = float(int(angle_deg) - int(prev_angle_deg))
+            delta_ccw_rad = math.radians(delta_ccw_deg)
             start_pt = _rotate_point_about(prev_start_pt, (cx, cy), delta_ccw_rad)
             end_pt = _rotate_point_about(prev_end_pt, (cx, cy), delta_ccw_rad)
 
@@ -373,4 +373,3 @@ def build_star_measurement_plan(
         range_task_names=range_task_names,
         transition_count=int(transition_count),
     )
-
