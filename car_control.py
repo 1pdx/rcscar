@@ -156,6 +156,16 @@ class ScoutMiniCAN:
     MAX_LINEAR_MPS = 3.0          # m/s
     MAX_ANGULAR_RADPS = 2.5       # rad/s
 
+    @staticmethod
+    def _adaptive_circle_stanley_gain(radius_m: float) -> float:
+        """Radius-adaptive Stanley gain for circle tracking."""
+        try:
+            radius = abs(float(radius_m))
+        except (TypeError, ValueError):
+            radius = 40.0
+        raw_gain = 0.20 + 0.005 * radius
+        return _sat(raw_gain, 0.25, 0.40)
+
     def _is_nearly_straight_segment(self, waypoints: List[Tuple[float, float]]) -> bool:
         if len(waypoints) < 3:
             return True
@@ -599,6 +609,7 @@ class ScoutMiniCAN:
             f"[ScoutMiniCAN] move_circle(PID): center=({cx:.2f},{cy:.2f}), "
             f"R={radius_m:.2f}m, angle={angle_deg:.1f}deg, cw={clockwise}"
         )
+        stanley_gain_use = self._adaptive_circle_stanley_gain(radius_m)
 
         self.follow_path_with_pid(
             waypoints=waypoints,
@@ -606,7 +617,7 @@ class ScoutMiniCAN:
             dt=dt,
             update_pose=update_pose,
             lookahead_distance=0.4,
-            stanley_gain=0.4,
+            stanley_gain=stanley_gain_use,
             smoothing_strength=0.8,
             smoothing_strength_curve=0.88,
             w_bias_tau=0.9,

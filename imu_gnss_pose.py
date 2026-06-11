@@ -155,6 +155,9 @@ class ImuStatusSummary:
     mode: str  # "INS", "NONE"
     ins_status: Optional[str]
     ins_pos_type: Optional[str]
+    lat_sigma_m: Optional[float]
+    lon_sigma_m: Optional[float]
+    hgt_sigma_m: Optional[float]
 
     has_inspvax: bool
     age_inspvax: Optional[float]     # 距离上一次 INSPVAXA 的时间（秒）
@@ -279,6 +282,9 @@ class ImuGnssClient:
                 mode=mode,
                 ins_status=(self._ins.get("ins_status") if self._ins else None),
                 ins_pos_type=(self._ins.get("pos_type") if self._ins else None),
+                lat_sigma_m=(self._ins.get("lat_std") if self._ins else None),
+                lon_sigma_m=(self._ins.get("lon_std") if self._ins else None),
+                hgt_sigma_m=(self._ins.get("hgt_std") if self._ins else None),
                 has_inspvax=self._t_inspvax is not None,
                 age_inspvax=age_insp,
                 freq_inspvax=self._freq_inspvax,

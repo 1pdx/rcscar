@@ -483,6 +483,164 @@ def parse_cluster_general(data: bytes) -> dict:
     }
 
 
+def encode_cluster_quality_payload(
+    cluster_id: int = 0,
+    dist_long_rms_idx: int = 0,
+    vrel_long_rms_idx: int = 0,
+    dist_lat_rms_idx: int = 0,
+    pdh0: int = 7,
+    vrel_lat_rms_idx: int = 0,
+    ambig_state: int = 3,
+    invalid_state: int = 0,
+    *,
+    layout: str = "default",
+) -> bytes:
+    """与 parse_cluster_quality 互逆（供测试/仿真）；layout 取值同 CLUSTER_702_LAYOUT。"""
+    lay = (layout or "default").strip().lower()
+    v = 0
+    v |= int(cluster_id) & 0xFF
+    if lay in ("table36", "t36", "manual32"):
+        v |= (int(dist_long_rms_idx) & 0x1F) << 11
+        v |= (int(vrel_long_rms_idx) & 0x1F) << 17
+        v |= (int(dist_lat_rms_idx) & 0x1F) << 22
+        v |= (int(pdh0) & 0x07) << 24
+        v |= (int(vrel_lat_rms_idx) & 0x1F) << 28
+        v |= (int(ambig_state) & 0x07) << 32
+        v |= (int(invalid_state) & 0x1F) << 35
+    else:
+        v |= (int(dist_long_rms_idx) & 0x1F) << 11
+        v |= (int(vrel_long_rms_idx) & 0x1F) << 17
+        v |= (int(dist_lat_rms_idx) & 0x1F) << 22
+        v |= (int(pdh0) & 0x07) << 27
+        v |= (int(vrel_lat_rms_idx) & 0x1F) << 30
+        v |= (int(ambig_state) & 0x07) << 35
+        v |= (int(invalid_state) & 0x1F) << 38
+    return v.to_bytes(8, "little")
+
+
+def cluster_quality_accepts(general: Dict[str, Any], quality: Optional[Dict[str, Any]]) -> bool:
+    """
+    是否保留该簇用于写 CSV / 统计。general 为 parse_cluster_general 结果；quality 为同 Cluster_ID 的
+    parse_cluster_quality 结果，若无则 quality=None。
+    """
+    if not CLUSTER_QUALITY_FILTER:
+        return True
+    if quality is None:
+        return not CLUSTER_QUALITY_STRICT
+    try:
+        pdh = int(quality.get("Pdh0", 0))
+    except (TypeError, ValueError):
+        return not CLUSTER_QUALITY_STRICT
+    if pdh <= 0:
+        return False
+    if pdh < int(CLUSTER_QUALITY_MIN_PDH):
+        return False
+
+    try:
+        inv = int(quality.get("InvalidState", 0))
+    except (TypeError, ValueError):
+        inv = 0
+    if inv in CLUSTER_QUALITY_REJECT_INVALID:
+        return False
+
+    try:
+        amb = int(quality.get("AmbigState", 0))
+    except (TypeError, ValueError):
+        amb = 0
+    if CLUSTER_QUALITY_AMBIG_OK is not None and amb not in CLUSTER_QUALITY_AMBIG_OK:
+        return False
+
+    try:
+        dlr = int(quality.get("DistLongRmsIdx", 0))
+        dlat = int(quality.get("DistLatRmsIdx", 0))
+        vlr = int(quality.get("VrelLongRmsIdx", 0))
+        vlat = int(quality.get("VrelLatRmsIdx", 0))
+    except (TypeError, ValueError):
+        return False
+    if dlr > int(CLUSTER_QUALITY_MAX_DIST_LONG_RMS_IDX):
+        return False
+    if dlat > int(CLUSTER_QUALITY_MAX_DIST_LAT_RMS_IDX):
+        return False
+    if vlr > int(CLUSTER_QUALITY_MAX_VREL_LONG_RMS_IDX):
+        return False
+    if vlat > int(CLUSTER_QUALITY_MAX_VREL_LAT_RMS_IDX):
+        return False
+    return True
+
+
+def _merge_quality_into_clusters(
+    clusters: List[Dict[str, Any]],
+    quality_by_id: Dict[int, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """按 Cluster_ID 合并 0x702，并按 cluster_quality_accepts 过滤。"""
+    out: List[Dict[str, Any]] = []
+    for c in clusters:
+        try:
+            cid = int(c.get("ClusterID", -1))
+        except (TypeError, ValueError):
+            cid = -1
+        q = quality_by_id.get(cid) if cid >= 0 else None
+        if not cluster_quality_accepts(c, q):
+            continue
+        if q:
+            merged = dict(c)
+            for k, v in q.items():
+                if k != "ClusterID":
+                    merged[k] = v
+            out.append(merged)
+        else:
+            out.append(c)
+    return out
+
+
+def encode_cluster_general_payload(
+    cluster_id: int = 0,
+    dx: float = 0.0,
+    dy: float = 0.0,
+    dyn_prop: int = 0,
+    rcs: float = 0.0,
+    vx: float = 0.0,
+    vy: float = 0.0,
+) -> bytes:
+    """
+    Table 33 编码（与 parse_cluster_general 互逆，供演示帧 / 单测）。
+    """
+    dist_long_raw = int(round((float(dx) + 500.0) / 0.2))
+    dist_lat_raw = int(round((float(dy) + 102.3) / 0.2))
+    dist_long_raw = max(0, min(dist_long_raw, 0x1FFF))
+    dist_lat_raw = max(0, min(dist_lat_raw, 0x3FF))
+    dist_long1 = (dist_long_raw >> 5) & 0xFF
+    dist_long2 = dist_long_raw & 0x1F
+    dist_lat1 = (dist_lat_raw >> 8) & 0x3
+    dist_lat2 = dist_lat_raw & 0xFF
+
+    vrel_long_raw = int(round((float(vx) + 128.0) / 0.25))
+    vrel_lat_raw = int(round((float(vy) + 64.0) / 0.25))
+    vrel_long_raw = max(0, min(vrel_long_raw, 0x3FF))
+    vrel_lat_raw = max(0, min(vrel_lat_raw, 0x1FF))
+    vrel_long1 = (vrel_long_raw >> 2) & 0xFF
+    vrel_long2 = vrel_long_raw & 0x3
+    vrel_lat1 = (vrel_lat_raw >> 3) & 0x3F
+    vrel_lat2 = vrel_lat_raw & 0x7
+
+    rcs_i = int(round((float(rcs) + 64.0) / 0.5))
+    rcs_i = max(0, min(rcs_i, 0xFF))
+
+    v = 0
+    v |= int(cluster_id) & 0xFF
+    v |= dist_long1 << 8
+    v |= dist_lat1 << 16
+    v |= dist_long2 << 19
+    v |= dist_lat2 << 24
+    v |= vrel_long1 << 32
+    v |= vrel_lat1 << 40
+    v |= vrel_long2 << 46
+    v |= (int(dyn_prop) & 0x7) << 48
+    v |= vrel_lat2 << 53
+    v |= rcs_i << 56
+    return v.to_bytes(8, "little")
+
+
 # ─────────────────────────────────────────────
 #  0x702 Cluster_2_Quality 解析（Table 35–37）
 # ─────────────────────────────────────────────
