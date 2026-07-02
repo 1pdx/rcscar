@@ -28,6 +28,7 @@ FORWARD_STRAIGHT_TRACKING_KWARGS: Dict[str, Any] = {
     "stanley_softening_speed_mps": 1.0,
     "straight_switch_pause_s": 0.12,
     "stanley_lateral_pd_kp": 0.0,
+    "stanley_lateral_pd_ki": 0.02,
     "stanley_lateral_pd_kd": 0.0,
     "speed_pid_kp": 0.95,
     "speed_pid_ki": 0.20,
@@ -44,10 +45,10 @@ FORWARD_STRAIGHT_TRACKING_KWARGS: Dict[str, Any] = {
     "yaw_rate_pid_kd": 0.0,
     "max_w_rate": 2.05,
     "max_w_step": 0.031,
-    "smoothing_strength": 0.76,
+    "smoothing_strength": 0.55,
     "smoothing_strength_curve": 0.88,
-    "w_bias_tau": 0.95,
-    "w_bias_hf_gain": 0.16,
+    "w_bias_tau": 0.60,
+    "w_bias_hf_gain": 0.35,
 }
 
 
@@ -1018,13 +1019,14 @@ class ScoutMiniCAN:
         注意：当前 `follow_path_with_pid` 是 PID 直线/圆弧跟踪实现，部分 Stanley/PID 扩展参数会被忽略。
         """
         if float(speed_sign) < 0.0:
-            # 倒车段：保守一点的角速度变化、稍大前瞻
+            # 倒车段：保守一点的角速度变化、稍大前瞻，小积分项消除稳态偏移
             return {
                 "lookahead_distance": 4.0,
                 "tracking_mode": "stanley",
                 "stanley_gain": 0.4,
                 "stanley_softening_speed_mps": 1.0,
                 "stanley_lateral_pd_kp": 0.0,
+                "stanley_lateral_pd_ki": 0.02,
                 "stanley_lateral_pd_kd": 0.0,
                 "stanley_lateral_pd_output_limit_radps": 1.15,
                 "max_w_rate": 3.0,
@@ -1070,6 +1072,7 @@ class ScoutMiniCAN:
         stanley_gain: float = 0.4,
         stanley_softening_speed_mps: float = 0.55,
         stanley_lateral_pd_kp: float = 0.0,
+        stanley_lateral_pd_ki: float = 0.0,
         stanley_lateral_pd_kd: float = 0.0,
         stanley_lateral_pd_output_limit_radps: float = 1.15,
         enable_stanley_w_pid: bool = False,
@@ -1168,8 +1171,8 @@ class ScoutMiniCAN:
         loop_finish_min = 0.0
         if is_loop:
             loop_finish_min = max(total_len * 0.7, total_len - 2.0 * max(0.1, lookahead_distance))
-        near_goal_deadband = max(arrival_dist * 3.0, 0.15)
-        near_goal_hold_s = 0.4
+        near_goal_deadband = max(arrival_dist * 1.5, 0.15)
+        near_goal_hold_s = 0.3
         near_goal_since: Optional[float] = None
         prev_cmd_v: Optional[float] = None
         prev_cmd_w: Optional[float] = None
@@ -1295,7 +1298,9 @@ class ScoutMiniCAN:
                         dt_eff_stanley_pid = float(dt) if dt and float(dt) > 0 else 0.02
                     except Exception:
                         dt_eff_stanley_pid = 0.02
-                    if abs(float(stanley_lateral_pd_kp)) > 1e-9 or abs(float(stanley_lateral_pd_kd)) > 1e-9:
+                    if (abs(float(stanley_lateral_pd_kp)) > 1e-9
+                            or abs(float(stanley_lateral_pd_ki)) > 1e-9
+                            or abs(float(stanley_lateral_pd_kd)) > 1e-9):
                         try:
                             dt_eff_pd = float(dt) if dt and float(dt) > 0 else 0.02
                         except Exception:
@@ -1305,10 +1310,27 @@ class ScoutMiniCAN:
                         prev_err = float(getattr(self, "_stanley_lat_pd_prev_err"))
                         derr = (float(lateral_error) - prev_err) / max(1e-6, dt_eff_pd)
                         self._stanley_lat_pd_prev_err = float(lateral_error)
-                        stanley_lateral_pd_out = float(stanley_lateral_pd_kp) * float(lateral_error) + float(
-                            stanley_lateral_pd_kd
-                        ) * float(derr)
                         lim = max(0.05, abs(float(stanley_lateral_pd_output_limit_radps)))
+                        # 积分项（带抗饱和）：仅在小误差时累积，用于消除稳态偏置
+                        if not hasattr(self, "_stanley_lat_pd_integral"):
+                            self._stanley_lat_pd_integral = 0.0
+                        if abs(float(lateral_error)) < 0.15:
+                            self._stanley_lat_pd_integral += float(lateral_error) * dt_eff_pd
+                            max_i_contrib = lim * 0.10
+                            max_integral = max_i_contrib / max(
+                                1e-6, abs(float(stanley_lateral_pd_ki))
+                            )
+                            self._stanley_lat_pd_integral = _sat(
+                                self._stanley_lat_pd_integral, -max_integral, max_integral
+                            )
+                        else:
+                            self._stanley_lat_pd_integral = 0.0
+                        stanley_lateral_pd_out = (
+                            float(stanley_lateral_pd_kp) * float(lateral_error)
+                            + float(stanley_lateral_pd_ki)
+                            * float(self._stanley_lat_pd_integral)
+                            + float(stanley_lateral_pd_kd) * float(derr)
+                        )
                         stanley_lateral_pd_out = _sat(stanley_lateral_pd_out, -lim, lim)
     
                     # 先得到 Stanley 的角速度输出（用于满足横向/航向误差）

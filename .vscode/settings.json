@@ -1,0 +1,7 @@
+{
+  "code-runner.ignoreSelection": true,
+  "code-runner.runInTerminal": true,
+  "code-runner.executorMap": {
+    "python": "python -u"
+  }
+}

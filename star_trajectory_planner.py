@@ -5,8 +5,8 @@ star_trajectory_planner.py
 
 设计目标：
 - ENU 校准后在平面系选择目标点，以目标点为参考定义角度零方向
-- 角度定义：以「轨迹原点(锚点) -> 目标点」为 0°，向左(逆时针)为正
-- 每个角度生成可重复往返的直线：第一条直线由原点与 0°方向确定；后续角度的直线由上一条直线
+- 角度定义：以「目标点 -> 平面 -Y」为 0°，向左(逆时针)为正
+- 每个角度生成可重复往返的直线：第一条直线由目标物 -Y 方向确定；后续角度的直线由上一条直线
   以“目标点”为圆心旋转得到（例如 +30°），因此“起点”会随角度在目标点周围旋转
 - 角度切换时，插入外部规划的平滑过渡（如三次 Bezier，呈 S 形），落到下一直线内侧端点前的衔接点，
   再短直道贴入内侧端点后倒车回该角测量起点
@@ -161,11 +161,9 @@ def build_star_measurement_plan(
 
     cx, cy = float(target_point_xy[0]), float(target_point_xy[1])
     ox, oy = float(origin_xy[0]), float(origin_xy[1])
-    base_dx = cx - ox
-    base_dy = cy - oy
-    if math.hypot(base_dx, base_dy) < 0.05:
-        raise ValueError("目标点距离轨迹原点过近，无法稳定定义 0° 基准方向。")
-    base_heading = math.atan2(base_dy, base_dx)
+    # 0° 的测量射线定义为“目标物点朝向 -Y 方向”。
+    # 路径的前进测量方向为外侧 -> 靠近目标，因此车辆运动 heading 为 +Y。
+    base_heading = math.pi * 0.5
 
     plan_points: List[Tuple[float, float]] = []
     plan_ranges: List[SegmentRange] = []
@@ -203,7 +201,7 @@ def build_star_measurement_plan(
         # “左侧为正(逆时针)”与数学航向 CCW 为正一致：heading = base + angle
         heading = _wrap_angle_rad(base_heading + math.radians(float(angle_deg)))
         if prev_start_pt is None or prev_end_pt is None or prev_angle_deg is None:
-            # 第一条：以原点出发的 0°/指定角度直线
+            # 第一条：以目标物 -Y 射线为 0°/指定角度直线
             start_pt, end_pt = ray_endpoints_from_origin(heading)
         else:
             # 后续：把上一条直线以“目标点”为圆心旋转得到

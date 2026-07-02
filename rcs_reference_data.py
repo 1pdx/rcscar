@@ -183,7 +183,7 @@ def _limits_toddler():
         "x": t,
         "lower": np.asarray(y11, dtype=float),
         "upper": np.asarray(y12, dtype=float),
-        "xlim": (0.0, 50.0),
+        "xlim": (0.0, 60.0),
         "ylim": (-25.0, 6.0),
     }
 

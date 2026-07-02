@@ -950,6 +950,70 @@ def define_local_frame_from_two_geodetic_points(
     return summary
 
 
+def define_local_frame_from_geodetic_y_axis_second_origin(
+    first_lat_deg: float,
+    first_lon_deg: float,
+    second_lat_deg: float,
+    second_lon_deg: float,
+    first_height_m: Optional[float] = None,
+    second_height_m: Optional[float] = None,
+) -> EnuCalibrationSummary:
+    """
+    用两个实时采集的经纬度点建立平面坐标系：
+
+    - 清除既有 ENU 旋转平移校准后重算；
+    - 第一个点指向第二个点的水平方向对齐为 +Y 轴；
+    - 第二个点设置为平面原点，即该点在 get_robot_pose 下为 (0,0)；
+    - INS 航向随平面旋转叠加同一旋转角，与路径坐标一致。
+    """
+    clear_enu_calibration()
+
+    client = _get_client()
+    ref = client.get_reference()
+    if ref is None:
+        raise RuntimeError("ENU reference is not initialized yet; wait for GNSS fix")
+    ref_lat, ref_lon, ref_h = ref
+
+    h0 = float(first_height_m) if first_height_m is not None else float(ref_h)
+    h1 = float(second_height_m) if second_height_m is not None else float(ref_h)
+
+    p1_x, p1_y, _ = _geodetic_to_enu_raw(
+        float(first_lat_deg),
+        float(first_lon_deg),
+        h0,
+        ref_lat,
+        ref_lon,
+        ref_h,
+    )
+    p2_x, p2_y, _ = _geodetic_to_enu_raw(
+        float(second_lat_deg),
+        float(second_lon_deg),
+        h1,
+        ref_lat,
+        ref_lon,
+        ref_h,
+    )
+
+    summary = align_enu_y_axis_with_points([(p1_x, p1_y), (p2_x, p2_y)])
+
+    p2_cx, p2_cy, _ = _geodetic_to_enu(
+        float(second_lat_deg),
+        float(second_lon_deg),
+        h1,
+        ref_lat,
+        ref_lon,
+        ref_h,
+    )
+    set_position_origin_to_xy(p2_cx, p2_cy)
+    print(
+        "[imu_gnss_pose] Geodetic two-point frame: "
+        f"P1=({float(first_lat_deg):.8f},{float(first_lon_deg):.8f}) -> "
+        f"P2=({float(second_lat_deg):.8f},{float(second_lon_deg):.8f}) is +Y; "
+        f"P2 plane origin before shift=({p2_cx:.3f},{p2_cy:.3f}) m."
+    )
+    return summary
+
+
 def clear_enu_calibration() -> None:
     global _enu_calib_enabled
     global _enu_calib_rot_rad
