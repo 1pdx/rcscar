@@ -1,0 +1,4 @@
+interface:
+  display_name: "研究生组会科研PPT"
+  short_description: "从论文证据生成蓝白科研风格的研究生组会汇报PPT制作技能"
+  default_prompt: "Use $make-graduate-lab-ppt to turn my paper folder into a Chinese graduate lab-meeting presentation."
